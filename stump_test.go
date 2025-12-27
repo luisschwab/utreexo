@@ -6,7 +6,74 @@ import (
 	"math/rand"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
+
+// FuzzStumpBuilding tests that the below cases are equal:
+//
+// 1: adding leaves (a, b, c, d) and removing (a).
+// 2: adding leaves (empty, b, c, d).
+func FuzzStumpBuilding(f *testing.F) {
+	var tests = []struct {
+		numAdds  uint32
+		duration uint32
+		seed     int64
+	}{
+		{3, 0x07, 0x07},
+	}
+	for _, test := range tests {
+		f.Add(test.numAdds, test.duration, test.seed)
+	}
+
+	f.Fuzz(func(t *testing.T, numAdds, duration uint32, seed int64) {
+		t.Parallel()
+
+		// simulate blocks with simchain
+		sc := newSimChainWithSeed(duration, seed)
+
+		m := NewMapPollard(true)
+
+		blocks := uint32(100)
+		allAdds := make([]Leaf, 0, numAdds*blocks)
+		delMap := make(map[Hash]struct{}, numAdds*blocks)
+		for b := uint32(0); b <= blocks; b++ {
+			adds, _, delHashes := sc.NextBlock(numAdds)
+			allAdds = append(allAdds, adds...)
+			for _, delHash := range delHashes {
+				delMap[delHash] = struct{}{}
+			}
+
+			// Modify the mappollard as we create and delete leaves.
+			proof, err := m.Prove(delHashes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = m.Modify(adds, delHashes, proof)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// For each add, add to the stump if it's not deleted.
+		// Add an empty hash if it's already deleted.
+		allM := Stump{}
+		for i, add := range allAdds {
+			_, deleted := delMap[allAdds[i].Hash]
+			if deleted {
+				allM.Add([]Hash{empty})
+			} else {
+				allM.Add([]Hash{add.Hash})
+			}
+		}
+
+		// Compare roots.
+		roots := m.GetRoots()
+		roots1 := allM.Roots
+
+		require.Equal(t, roots, roots1)
+	})
+}
 
 func FuzzStump(f *testing.F) {
 	var tests = []struct {

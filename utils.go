@@ -12,6 +12,13 @@ import (
 
 // parentHash returns the hash of the left and right hashes passed in.
 func parentHash(l, r Hash) Hash {
+	if l == empty {
+		return r
+	}
+	if r == empty {
+		return l
+	}
+
 	h := sha512.New512_256()
 	h.Write(l[:])
 	h.Write(r[:])

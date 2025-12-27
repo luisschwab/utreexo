@@ -130,6 +130,35 @@ func (s *Stump) del(delHashes []Hash, proof Proof) ([]Hash, []uint64, error) {
 	return intermediate.hashes, intermediate.positions, nil
 }
 
+// Add is a simplified version of stump.add() that can be used to simplify add new elements to
+// the stump. This add doesn't return the intermediate hashes and their positions so it
+// cannot be used with a wallet. For that, use stump.Update() instead.
+func (s *Stump) Add(adds []Hash) {
+	for _, add := range adds {
+		// We can tell where the roots are by looking at the binary representation
+		// of the numLeaves. Wherever there's a 1, there's a root.
+		//
+		// numLeaves of 8 will be '1000' in binary, so there will be one root at
+		// row 3. numLeaves of 3 will be '11' in binary, so there's two roots. One at
+		// row 0 and one at row 1.
+		//
+		// In this loop below, we're looking for these roots by checking if there's
+		// a '1'. If there is a '1', we'll hash the root being added with that root
+		// until we hit a '0'.
+		newRoot := add
+		for h := uint8(0); (s.NumLeaves>>h)&1 == 1; h++ {
+			root := s.Roots[len(s.Roots)-1]
+			s.Roots = s.Roots[:len(s.Roots)-1]
+
+			// Calculate the hash of the new root and append it.
+			newRoot = parentHash(root, newRoot)
+		}
+
+		s.Roots = append(s.Roots, newRoot)
+		s.NumLeaves++
+	}
+}
+
 // add adds the passed in hashes to accumulator, adding new roots and
 // incrementing numLeaves. It also returns the intermediate hashes and their
 // positions used to calculate the newly created roots.
