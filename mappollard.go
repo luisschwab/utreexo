@@ -1184,6 +1184,25 @@ func newNodesMap(prealloc int) *NodesMap {
 	return &NodesMap{m: make(map[Hash]Node, prealloc)}
 }
 
+// InitWithStump allows a MapPollard to be ready for use based off of the roots and
+// numleaves from the stump.
+func InitWithStump(s Stump) *MapPollard {
+	mp := NewMapPollard(false)
+
+	for _, root := range s.Roots {
+		node := Node{
+			Remember: false,
+			AddIndex: -1,
+		}
+		mp.Nodes.Put(root, node)
+	}
+
+	mp.Roots = s.Roots
+	mp.NumLeaves = s.NumLeaves
+
+	return &mp
+}
+
 // MapPollard is an implementation of the utreexo accumulators that supports pollard
 // functionality.
 type MapPollard struct {
