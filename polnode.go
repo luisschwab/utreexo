@@ -57,11 +57,12 @@ func (n *polNode) getSibling() (*polNode, error) {
 
 	// Get my sibling which is pointing to my children.
 	var sibling *polNode
-	if n == aunt.lNiece {
+	switch n {
+	case aunt.lNiece:
 		sibling = aunt.rNiece
-	} else if n == aunt.rNiece {
+	case aunt.rNiece:
 		sibling = aunt.lNiece
-	} else {
+	default:
 		return nil, fmt.Errorf("Node with hash %s has an incorrect aunt pointer "+
 			"or the aunt with hash %s has incorrect pointer to its nieces",
 			hex.EncodeToString(n.data[:]), hex.EncodeToString(aunt.data[:]))
@@ -128,7 +129,7 @@ func (p *Pollard) getNode(pos uint64) (n, sibling, parent *polNode, err error) {
 	// bits tell us if we should go down to the left child or the right child.
 	if pos >= maxPosition(TreeRows(p.NumLeaves)) {
 		return nil, nil, nil,
-			fmt.Errorf("Position %d does not exist in tree of %d leaves", pos, p.NumLeaves)
+			fmt.Errorf("position %d does not exist in tree of %d leaves", pos, p.NumLeaves)
 	}
 	tree, branchLen, bits, err := DetectOffset(pos, p.NumLeaves)
 	if err != nil {
@@ -320,10 +321,8 @@ func delNode(node *polNode) {
 			node.aunt.rNiece = nil
 		} else if node.aunt.lNiece == node {
 			node.aunt.lNiece = nil
-		} else {
-			// Purposely left empty. It's ok if my aunt is not pointing
-			// at me because that means it's already been updated.
 		}
+		// Note: if aunt is not pointing at this node, it's already been updated.
 	}
 	node.aunt = nil
 

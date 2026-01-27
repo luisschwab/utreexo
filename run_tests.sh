@@ -5,9 +5,8 @@ set -ex
 env GORACE="halt_on_error=1" go test -race ./...
 
 # Automatic checks
-golangci-lint run --disable-all \
---enable=gofmt \
---enable=gosimple \
---enable=unconvert \
---enable=ineffassign \
---enable=govet
+# Linters (staticcheck includes gosimple checks)
+golangci-lint run --enable-only=staticcheck,unconvert,ineffassign,govet
+
+# Formatter check
+golangci-lint fmt --diff -E gofmt

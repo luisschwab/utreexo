@@ -425,7 +425,7 @@ func (p *Pollard) undoSingleAdd() {
 
 func (p *Pollard) undoDels(dels []uint64, delHashes []Hash) error {
 	if len(dels) != len(delHashes) {
-		return fmt.Errorf("Got %d targets to be deleted but have %d hashes",
+		return fmt.Errorf("got %d targets to be deleted but have %d hashes",
 			len(dels), len(delHashes))
 	}
 
@@ -471,7 +471,7 @@ func (p *Pollard) undoSingleDel(node *polNode, pos uint64) error {
 	siblingPos := Parent(pos, totalRows)
 	sibling, aunt, _, err := p.getNode(siblingPos)
 	if err != nil {
-		return fmt.Errorf("Couldn't undo %s at position %d, err: %v",
+		return fmt.Errorf("couldn't undo %s at position %d, err: %v",
 			hex.EncodeToString(node.data[:]), pos, err)
 	}
 

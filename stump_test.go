@@ -3,7 +3,6 @@ package utreexo
 import (
 	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
 
@@ -113,9 +112,6 @@ func FuzzStump(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, startLeaves uint32, modifyAdds uint32, delCount uint32, seed int64) {
 		t.Parallel()
-
-		// Set seed to make sure the test is reproducible.
-		rand.Seed(seed)
 
 		// delCount must be less than the current number of leaves.
 		if delCount > startLeaves {

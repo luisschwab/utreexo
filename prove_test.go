@@ -134,8 +134,6 @@ func FuzzGetMissingPositions(f *testing.F) {
 	f.Fuzz(func(t *testing.T, startLeaves uint32, delCount uint32, seed int64) {
 		t.Parallel()
 
-		rand.Seed(seed)
-
 		// It'll error out if we try to delete more than we have. >= since we want
 		// at least 2 leftOver leaf to test.
 		if int(delCount) >= int(startLeaves)-2 {
@@ -237,8 +235,6 @@ func FuzzAddProof(f *testing.F) {
 	f.Fuzz(func(t *testing.T, startLeaves uint32, delCount uint32, seed int64) {
 		t.Parallel()
 
-		rand.Seed(seed)
-
 		// It'll error out if we try to delete more than we have. >= since we want
 		// at least 2 leftOver leaf to test.
 		if int(delCount) >= int(startLeaves)-2 {
@@ -337,8 +333,6 @@ func FuzzUpdateProofRemove(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, startLeaves uint32, delCount uint32, seed int64) {
 		t.Parallel()
-
-		rand.Seed(seed)
 
 		// It'll error out if we try to delete more than we have. >= since we want
 		// at least 2 leftOver leaf to test.
@@ -494,8 +488,6 @@ func FuzzUpdateProofAdd(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, startLeaves, delCount, addCount uint32, seed int64) {
 		t.Parallel()
-
-		rand.Seed(seed)
 
 		// It'll error out if we try to delete more than we have. >= since we want
 		// at least 2 leftOver leaf to test.
@@ -766,8 +758,6 @@ func FuzzGetProofSubset(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, startLeaves uint32, delCount uint32, seed int64) {
 		t.Parallel()
-
-		rand.Seed(seed)
 
 		// It'll error out if we try to delete more than we have. >= since we want
 		// at least 3 leftOver leaf to test.
@@ -1152,7 +1142,6 @@ func FuzzUndoProof(f *testing.F) {
 	f.Fuzz(func(t *testing.T, seed int64, startLeaves uint8, modifyAdds uint8, delCount uint8) {
 		t.Parallel()
 
-		rand.Seed(seed)
 		// delCount must be less than the current number of leaves.
 		if delCount > startLeaves {
 			return
@@ -1792,9 +1781,6 @@ func FuzzGenTTLs(f *testing.F) {
 		sc := newSimChainWithSeed(duration, seed)
 
 		blockNum := 10
-		dels := make([][]Hash, 0, blockNum)
-		adds := make([][]Leaf, 0, blockNum)
-		durations := make([][]int32, 0, blockNum)
 		expectedTTLs := make([][]ttlInfo, blockNum)
 
 		cs := NewCachingScheduleTracker(blockNum)
@@ -1814,10 +1800,6 @@ func FuzzGenTTLs(f *testing.F) {
 						ttl: int(ttl),
 					})
 			}
-
-			adds = append(adds, add)
-			durations = append(durations, duration)
-			dels = append(dels, delHashes)
 
 			proof, err := p.Prove(delHashes)
 			if err != nil {

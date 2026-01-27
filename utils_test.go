@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"sort"
 	"testing"
-	"time"
 
 	"golang.org/x/exp/slices"
 )
@@ -367,9 +366,6 @@ func TestDeTwin(t *testing.T) {
 func TestDeTwinRand(t *testing.T) {
 	t.Parallel()
 
-	seed := time.Now().Unix()
-	rand.Seed(seed)
-
 	for x := 0; x < 100000; x++ {
 		// Forest with at least 3 rows but less than 11 rows.
 		forestRows := uint8(rand.Intn(11-3) + 3)
@@ -401,10 +397,10 @@ func TestDeTwinRand(t *testing.T) {
 		// Check that there are no siblings in the del slice.
 		for i := 0; i < len(dels); i++ {
 			if i+1 < len(dels) && rightSib(dels[i]) == dels[i+1] {
-				err := fmt.Errorf("TestDeTwinRand error: seed %v, forestRows %v, "+
+				err := fmt.Errorf("TestDeTwinRand error: forestRows %v, "+
 					"dels[i]=%d and dels[i+1]=%d are siblings. "+
 					"Original: %v, deTwined: %v",
-					seed, forestRows, dels[i], dels[i+1], origDels, dels)
+					forestRows, dels[i], dels[i+1], origDels, dels)
 				t.Fatal(err)
 			}
 		}
