@@ -510,24 +510,26 @@ func getNextPos(slice1, slice2 []uint64, slice1Idx, slice2Idx int) (uint64, int,
 	// Grab the next position.
 	var pos uint64
 	idx := nextLeastSlice(slice1, slice2, slice1Idx, slice2Idx)
-	if idx == 0 {
+	switch idx {
+	case 0:
 		pos = slice1[slice1Idx]
 		slice1Idx++
-	} else if idx == 1 {
+	case 1:
 		pos = slice2[slice2Idx]
 		slice2Idx++
-	} else {
+	default:
 		// Break if we don't have anymore elements left.
 		return pos, -1, -1
 	}
 
 	// Attempt to grab the sibling of the current position to process.
 	sibIdx := nextLeastSlice(slice1, slice2, slice1Idx, slice2Idx)
-	if sibIdx == 0 {
+	switch sibIdx {
+	case 0:
 		if rightSib(pos) != slice1[slice1Idx] {
 			sibIdx = -1
 		}
-	} else if sibIdx == 1 {
+	case 1:
 		if rightSib(pos) != slice2[slice2Idx] {
 			sibIdx = -1
 		}
@@ -622,7 +624,7 @@ func generateModifyIns(numLeaves uint64, delHashes []Hash, proof Proof) (
 		} else {
 			if len(proof.Proof) <= proofHashIdx {
 				return modifyInstruction{},
-					fmt.Errorf("invalid proof. Proof too short.")
+					fmt.Errorf("invalid proof: proof too short")
 			}
 
 			// If the next prove isn't the sibling of this prove, we fetch
@@ -835,7 +837,7 @@ func generateIngestAndUndoInfo(numLeaves uint64, delHashes []Hash, proof Proof) 
 		} else {
 			if len(proof.Proof) <= proofHashIdx {
 				return ingestInstruction{}, undoInfo{}, nil,
-					fmt.Errorf("invalid proof. Proof too short.")
+					fmt.Errorf("invalid proof: proof too short")
 			}
 
 			// If the next prove isn't the sibling of this prove, we fetch
@@ -999,7 +1001,7 @@ func calculateHashes(numLeaves uint64, delHashes []Hash, proof Proof) (hashAndPo
 			}
 		} else {
 			if len(proof.Proof) <= proofHashIdx {
-				return hashAndPos{}, nil, fmt.Errorf("invalid proof. Proof too short.")
+				return hashAndPos{}, nil, fmt.Errorf("invalid proof: proof too short")
 			}
 
 			// If the next prove isn't the sibling of this prove, we fetch
@@ -1669,7 +1671,7 @@ func GetProofSubset(proof Proof, hashes []Hash, wants []uint64, numLeaves uint64
 	expectedEmpty := copySortedFunc(wants, uint64Cmp)
 	expectedEmpty = subtractSortedSlice(expectedEmpty, proofTargetsCopy, uint64Cmp)
 	if len(expectedEmpty) > 0 {
-		err := fmt.Errorf("Missing positions %v from the proof. Deletions %v, proof.Targets %v",
+		err := fmt.Errorf("missing positions %v from the proof: deletions %v, proof.Targets %v",
 			expectedEmpty, wants, proof.Targets)
 		return nil, Proof{}, err
 	}
@@ -1704,7 +1706,7 @@ func GetProofSubset(proof Proof, hashes []Hash, wants []uint64, numLeaves uint64
 	posAndHashes = getHashAndPosSubset(posAndHashes, wantProofPos)
 	if posAndHashes.Len() != len(wantProofPos) {
 		return nil, Proof{},
-			fmt.Errorf("Expected %d proofs but got %d", len(wantProofPos), posAndHashes.Len())
+			fmt.Errorf("expected %d proofs but got %d", len(wantProofPos), posAndHashes.Len())
 	}
 
 	// Lastly, we make separate slice of hashes as we guarantee that the hashes

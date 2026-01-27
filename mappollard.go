@@ -49,11 +49,12 @@ func (n *Node) pruneable(sib Node) (bool, error) {
 // getSibHash takes in a below node's hash and returns its sibhash.
 func (n *Node) getSibHash(hash Hash) (Hash, bool, error) {
 	// Grab sibling.
-	if hash == n.LBelow {
+	switch hash {
+	case n.LBelow:
 		return n.RBelow, false, nil
-	} else if hash == n.RBelow {
+	case n.RBelow:
 		return n.LBelow, true, nil
-	} else {
+	default:
 		return empty, false, fmt.Errorf("above node for hash %v points to left %v and right %v",
 			hash, n.LBelow, n.RBelow)
 	}
@@ -1666,7 +1667,7 @@ func (m *MapPollard) Prove(proveHashes []Hash) (Proof, error) {
 
 	// Check that the targets are proveable.
 	if !m.cached(proveHashes) {
-		return Proof{}, fmt.Errorf("Cannot prove:\n%s\nas not all of them are cached",
+		return Proof{}, fmt.Errorf("cannot prove:\n%s\nas not all of them are cached",
 			printHashes(proveHashes))
 	}
 
@@ -1899,7 +1900,7 @@ func (m *MapPollard) getHashesByPositions(positions []uint64) ([]Hash, error) {
 		// branchLen denotes how far down the root the position is.
 		// bits tell us if we should go down to the left child or the right child.
 		if pos >= maxPosition(TreeRows(m.NumLeaves)) {
-			return nil, fmt.Errorf("Position %d does not exist in tree of %d leaves",
+			return nil, fmt.Errorf("position %d does not exist in tree of %d leaves",
 				pos, m.NumLeaves)
 		}
 	}

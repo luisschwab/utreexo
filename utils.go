@@ -90,7 +90,7 @@ func ParentMany(position uint64, rise, forestRows uint8) (uint64, error) {
 		return position, nil
 	}
 	if rise > forestRows {
-		return 0, fmt.Errorf("Cannot rise more than the forestRows. "+
+		return 0, fmt.Errorf("cannot rise more than the forestRows: "+
 			"rise %d, forestRows %d", rise, forestRows)
 	}
 	mask := uint64(2<<forestRows) - 1
@@ -666,12 +666,8 @@ func String(ts ToString) string {
 				val := ts.GetHash(uint64(pos))
 				if val != empty {
 					valstring = fmt.Sprintf("%x", val[:2])
-
 					if pos >= 100 {
-						valstring = fmt.Sprintf("%x", val[:2])
 						valstring = valstring[:len(valstring)-1]
-					} else {
-						valstring = fmt.Sprintf("%x", val[:2])
 					}
 				}
 			}
@@ -726,8 +722,8 @@ func getRootPosition(position uint64, numLeaves uint64, forestRows uint8) (uint6
 	}
 
 	if position != 0 && forestRows != 0 {
-		return 0, fmt.Errorf("Couldn't fetch root position. "+
-			"Passed in position %d, numLeaves %d, forestRows %d",
+		return 0, fmt.Errorf("couldn't fetch root position: "+
+			"position %d, numLeaves %d, forestRows %d",
 			position, numLeaves, forestRows)
 	}
 
