@@ -11,6 +11,20 @@ import (
 // Assert that Forest implements the Utreexo interface.
 var _ Utreexo = (*Forest)(nil)
 
+// positionMap value packing: upper 17 bits = addIndex, lower 47 bits = position
+// Supports up to 2^47 (~140 trillion) leaves and 2^17 (131,072) adds per block.
+const (
+	positionBits = 47
+	positionMask = (1 << positionBits) - 1
+)
+
+func packPosIndex(pos uint64, addIndex int32) uint64 {
+	return (uint64(uint32(addIndex)) << positionBits) | (pos & positionMask)
+}
+
+func unpackPos(v uint64) uint64  { return v & positionMask }
+func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
+
 // Forest is a Utreexo accumulator backed by a contiguous file.
 // All nodes are stored at position-based offsets (position * 32 bytes).
 // Deleted leaves remain in the file for Undo support.
@@ -22,13 +36,14 @@ var _ Utreexo = (*Forest)(nil)
 // Forest uses a fixed forestRows to ensure stable position mappings.
 // This is set at creation time based on expected maximum leaves.
 type Forest struct {
-	file        io.ReadWriteSeeker
-	deletedFile io.ReadWriteSeeker // separate file tracking deleted leaf positions
-	NumLeaves   uint64
-	forestRows  uint8 // Fixed maximum rows for stable position mapping
+	file         io.ReadWriteSeeker
+	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions
+	addIndexFile io.ReadWriteSeeker // stores int32 addIndex at offset pos*4
+	NumLeaves    uint64
+	forestRows   uint8 // Fixed maximum rows for stable position mapping
 
-	// positionMap maps leaf hashes to their positions.
-	// Needed for Undo and Prove since caller only provides hashes, not positions.
+	// positionMap maps leaf hashes to packed (addIndex, position) values.
+	// Upper 17 bits = addIndex (index within Modify batch), lower 47 bits = position.
 	// Only tracks leaves (row 0), not intermediate nodes.
 	positionMap map[miniHash]uint64
 
@@ -41,15 +56,17 @@ type Forest struct {
 // NewForest creates a new Forest backed by the given file.
 // The file should be an io.ReadWriteSeeker (e.g., *os.File).
 // deletedFile tracks deleted leaf positions (can be nil for new forests).
+// addIndexFile stores the addIndex for each leaf (can be nil if TTLs not needed).
 // numLeaves indicates how many leaves have already been added (0 for new forest).
 // forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
 //
 // If numLeaves > 0, the positionMap is rebuilt by reading all leaf hashes from
 // the file, skipping positions recorded in deletedFile.
-func NewForest(file, deletedFile io.ReadWriteSeeker, numLeaves uint64, forestRows uint8) (*Forest, error) {
+func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uint64, forestRows uint8) (*Forest, error) {
 	f := &Forest{
 		file:                 file,
 		deletedFile:          deletedFile,
+		addIndexFile:         addIndexFile,
 		NumLeaves:            numLeaves,
 		forestRows:           forestRows,
 		positionMap:          make(map[miniHash]uint64, 2<<forestRows),
@@ -74,7 +91,11 @@ func NewForest(file, deletedFile io.ReadWriteSeeker, numLeaves uint64, forestRow
 		}
 		// Only add non-empty hashes to the map
 		if hash != empty {
-			f.positionMap[hash.mini()] = pos
+			addIndex, err := f.readAddIndex(pos)
+			if err != nil {
+				return nil, fmt.Errorf("rebuild addIndex at %d: %w", pos, err)
+			}
+			f.positionMap[hash.mini()] = packPosIndex(pos, addIndex)
 		}
 	}
 
@@ -225,17 +246,60 @@ func (f *Forest) writeHash(position uint64, hash Hash) error {
 	return nil
 }
 
-// Add adds a single leaf to the forest.
+// readAddIndex reads the addIndex for the leaf at the given position.
+// Returns -1 if addIndexFile is nil.
+func (f *Forest) readAddIndex(pos uint64) (int32, error) {
+	if f.addIndexFile == nil {
+		return -1, nil
+	}
+
+	offset := int64(pos * 4)
+	_, err := f.addIndexFile.Seek(offset, io.SeekStart)
+	if err != nil {
+		return 0, err
+	}
+
+	var addIndex int32
+	err = binary.Read(f.addIndexFile, binary.LittleEndian, &addIndex)
+	if err != nil {
+		return 0, err
+	}
+
+	return addIndex, nil
+}
+
+// writeAddIndex writes the addIndex for the leaf at the given position.
+func (f *Forest) writeAddIndex(pos uint64, addIndex int32) error {
+	if f.addIndexFile == nil {
+		return nil
+	}
+
+	offset := int64(pos * 4)
+	_, err := f.addIndexFile.Seek(offset, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	return binary.Write(f.addIndexFile, binary.LittleEndian, addIndex)
+}
+
+// add adds a single leaf to the forest.
 // If hash is empty, the sibling (existing root) moves up to the parent position.
-func (f *Forest) add(hash Hash) error {
+func (f *Forest) add(hash Hash, addIndex int32) error {
 	// Add to position map (before incrementing NumLeaves)
 	if hash != empty {
-		f.positionMap[hash.mini()] = f.NumLeaves
+		f.positionMap[hash.mini()] = packPosIndex(f.NumLeaves, addIndex)
 
 		// Write the leaf hash at position NumLeaves
 		err := f.writeHash(f.NumLeaves, hash)
 		if err != nil {
 			return fmt.Errorf("write leaf: %w", err)
+		}
+
+		// Write the addIndex
+		err = f.writeAddIndex(f.NumLeaves, addIndex)
+		if err != nil {
+			return fmt.Errorf("write addIndex: %w", err)
 		}
 	}
 
@@ -303,7 +367,7 @@ func (f *Forest) delete(delHashes []Hash) error {
 
 func (f *Forest) deleteSingle(delHash Hash) error {
 	// Get the original leaf position before any move-ups
-	leafPos := f.positionMap[delHash.mini()]
+	leafPos := unpackPos(f.positionMap[delHash.mini()])
 
 	// Record deletion: persist to file and track in memory
 	if err := f.recordDeletedPosition(leafPos); err != nil {
@@ -784,8 +848,8 @@ func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
 	}
 
 	// Then add.
-	for _, leaf := range adds {
-		err := f.add(leaf.Hash)
+	for i, leaf := range adds {
+		err := f.add(leaf.Hash, int32(i))
 		if err != nil {
 			return fmt.Errorf("add: %w", err)
 		}
@@ -794,14 +858,47 @@ func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
 	return nil
 }
 
+// ModifyAndReturnTTLs adds and deletes elements from the forest, returning
+// the addIndex for each deleted leaf. This allows computing TTL (time-to-live)
+// for deleted leaves. Returns -1 for leaves added via Ingest or without TTL tracking.
+func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, error) {
+	// Collect addIndexes before deletion
+	addIndexes := make([]int32, 0, len(delHashes))
+	for _, delHash := range delHashes {
+		packed, found := f.positionMap[delHash.mini()]
+		if !found {
+			return nil, fmt.Errorf("missing %v in positionMap. Cannot return ttls", delHash)
+		}
+		addIndexes = append(addIndexes, unpackIndex(packed))
+	}
+
+	// Delete first.
+	if len(delHashes) > 0 {
+		err := f.delete(delHashes)
+		if err != nil {
+			return nil, fmt.Errorf("delete: %w", err)
+		}
+	}
+
+	// Then add.
+	for i, leaf := range adds {
+		err := f.add(leaf.Hash, int32(i))
+		if err != nil {
+			return nil, fmt.Errorf("add: %w", err)
+		}
+	}
+
+	return addIndexes, nil
+}
+
 // calculatePosition calculates the logical position of the given hash.
 func (f *Forest) calculatePosition(hash Hash) (uint64, error) {
-	pos, found := f.positionMap[hash.mini()]
+	packed, found := f.positionMap[hash.mini()]
 	if !found {
 		return 0, fmt.Errorf("hash %v not found in the position map", hash)
 	}
 
-	currentPos := pos
+	currentPos := unpackPos(packed)
 	currentHash := hash
 	rowsToTop := 0
 	leftRightIndicator := uint64(0)
@@ -857,7 +954,7 @@ func (f *Forest) fetchProofHashes(delHashes []Hash) ([]Hash, error) {
 	// Build targets with both calculated and actual positions
 	targets := make([]targetPair, 0, len(delHashes))
 	for _, delHash := range delHashes {
-		leafPos, found := f.positionMap[delHash.mini()]
+		packed, found := f.positionMap[delHash.mini()]
 		if !found {
 			return nil, fmt.Errorf("hash %v not found in the position map", delHash)
 		}
@@ -867,7 +964,7 @@ func (f *Forest) fetchProofHashes(delHashes []Hash) ([]Hash, error) {
 			return nil, err
 		}
 
-		targets = append(targets, targetPair{calcPos: calcPos, actualPos: leafPos})
+		targets = append(targets, targetPair{calcPos: calcPos, actualPos: unpackPos(packed)})
 	}
 
 	// Sort by calculated position to match pollard ordering
@@ -1032,8 +1129,8 @@ func (f *Forest) Verify(delHashes []Hash, proof Proof, remember bool) error {
 // GetLeafPosition returns the position for the given leaf hash.
 // This implements the Utreexo interface.
 func (f *Forest) GetLeafPosition(hash Hash) (uint64, bool) {
-	pos, ok := f.positionMap[hash.mini()]
-	return pos, ok
+	packed, ok := f.positionMap[hash.mini()]
+	return unpackPos(packed), ok
 }
 
 // String returns a string representation of the forest.

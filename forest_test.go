@@ -124,7 +124,7 @@ func compareRoots(t *testing.T, forest *Forest, pollard Pollard, context string)
 func TestForestString(t *testing.T) {
 	file := newMemFile()
 	// Use small forestRows for visualization
-	forest, err := NewForest(file, nil, 0, 3)
+	forest, err := NewForest(file, nil, nil, 0, 3)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestForestString(t *testing.T) {
 	// Add 4 leaves
 	for i := 0; i < 4; i++ {
 		hash := testHashFromInt(i + 1)
-		err := forest.add(hash)
+		err := forest.add(hash, 0)
 		if err != nil {
 			t.Fatalf("Add %d: %v", i, err)
 		}
@@ -149,7 +149,7 @@ func TestForestString(t *testing.T) {
 // TestForestSanityCheck tests that sanityCheck catches inconsistencies.
 func TestForestSanityCheck(t *testing.T) {
 	file := newMemFile()
-	forest, err := NewForest(file, nil, 0, 10)
+	forest, err := NewForest(file, nil, nil, 0, 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestForestSanityCheck(t *testing.T) {
 	hashes := make([]Hash, 4)
 	for i := 0; i < 4; i++ {
 		hashes[i] = testHashFromInt(i + 1)
-		err := forest.add(hashes[i])
+		err := forest.add(hashes[i], 0)
 		if err != nil {
 			t.Fatalf("add %d: %v", i, err)
 		}
@@ -393,7 +393,7 @@ func FuzzForestChain(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, 0, 16)
+		forest, err := NewForest(memFile, delFile, nil, 0, 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -513,7 +513,7 @@ func FuzzTreeBuilding(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, 0, 17)
+		forest, err := NewForest(memFile, delFile, nil, 0, 17)
 		if err != nil {
 			t.Fatal(err)
 		}
