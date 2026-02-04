@@ -124,7 +124,7 @@ func compareRoots(t *testing.T, forest *Forest, pollard Pollard, context string)
 func TestForestString(t *testing.T) {
 	file := newMemFile()
 	// Use small forestRows for visualization
-	forest, err := NewForest(file, nil, nil, 0, 3)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), 0, 3)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestForestString(t *testing.T) {
 // TestForestSanityCheck tests that sanityCheck catches inconsistencies.
 func TestForestSanityCheck(t *testing.T) {
 	file := newMemFile()
-	forest, err := NewForest(file, nil, nil, 0, 10)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), 0, 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -238,17 +238,16 @@ func TestForestSanityCheck(t *testing.T) {
 // This implements the UtreexoTest interface.
 func (f *Forest) sanityCheck() error {
 	// Check 0: Verify deletedLeafPositions map matches deletedFile length
-	if f.deletedFile != nil {
-		fileSize, err := f.deletedFile.Seek(0, io.SeekEnd)
-		if err != nil {
-			return fmt.Errorf("deletedFile seek: %w", err)
-		}
-		fileEntries := fileSize / 8
-		mapEntries := int64(len(f.deletedLeafPositions))
-		if fileEntries != mapEntries {
-			return fmt.Errorf("deletedLeafPositions mismatch: file has %d entries, map has %d",
-				fileEntries, mapEntries)
-		}
+	fileSize, err := f.deletedFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("deletedFile seek: %w", err)
+	}
+	// Account for 8-byte header (recordMode + reserved)
+	fileEntries := (fileSize - deletedFileHeaderSize) / 8
+	mapEntries := int64(len(f.deletedLeafPositions))
+	if fileEntries != mapEntries {
+		return fmt.Errorf("deletedLeafPositions mismatch: file has %d entries, map has %d",
+			fileEntries, mapEntries)
 	}
 
 	// Cache file reads - many paths share ancestors
@@ -393,7 +392,7 @@ func FuzzForestChain(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, nil, 0, 16)
+		forest, err := NewForest(memFile, delFile, newMemFile(), 0, 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -458,6 +457,80 @@ func FuzzForestChain(f *testing.F) {
 	})
 }
 
+// FuzzForestRecord tests that Record + HashAll produces the same result as Modify.
+func FuzzForestRecord(f *testing.F) {
+	var tests = []struct {
+		numAdds  uint32
+		duration uint32
+		seed     int64
+	}{
+		{3, 0x07, 0x07},
+	}
+	for _, test := range tests {
+		f.Add(test.numAdds, test.duration, test.seed)
+	}
+
+	f.Fuzz(func(t *testing.T, numAdds, duration uint32, seed int64) {
+		t.Parallel()
+
+		sc := newSimChainWithSeed(duration, seed)
+
+		// Forest using normal Modify
+		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Forest using Record + HashAll
+		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Process all blocks with both approaches
+		for b := 0; b <= 100; b++ {
+			adds, _, delHashes := sc.NextBlock(numAdds)
+
+			// Modify forest needs proof for deletions
+			proof, err := modifyForest.Prove(delHashes)
+			if err != nil {
+				t.Fatalf("block %d: Prove error: %v", b, err)
+			}
+
+			err = modifyForest.Modify(adds, delHashes, proof)
+			if err != nil {
+				t.Fatalf("block %d: Modify error: %v", b, err)
+			}
+
+			// Record forest just records without hashing
+			addHashes := make([]Hash, len(adds))
+			for i, add := range adds {
+				addHashes[i] = add.Hash
+			}
+			_, err = recordForest.Record(addHashes, delHashes)
+			if err != nil {
+				t.Fatalf("block %d: Record error: %v", b, err)
+			}
+		}
+
+		// Now hash all for the record forest
+		err = recordForest.HashAll()
+		if err != nil {
+			t.Fatalf("HashAll error: %v", err)
+		}
+
+		// Compare roots
+		modifyRoots := modifyForest.GetRoots()
+		recordRoots := recordForest.GetRoots()
+		require.Equal(t, modifyRoots, recordRoots, "roots should match after Record+HashAll vs Modify")
+
+		err = recordForest.sanityCheck()
+		if err != nil {
+			t.Fatalf("HashAll error: %v", err)
+		}
+	})
+}
+
 // FuzzTreeBuilding tests that the trees built from adding empty hashes for deleted leaves
 // have the same roots as the ones that added the actual value of the leaves and then deleted
 // them.
@@ -513,7 +586,7 @@ func FuzzTreeBuilding(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, nil, 0, 17)
+		forest, err := NewForest(memFile, delFile, newMemFile(), 0, 17)
 		if err != nil {
 			t.Fatal(err)
 		}

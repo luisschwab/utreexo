@@ -25,6 +25,10 @@ func packPosIndex(pos uint64, addIndex int32) uint64 {
 func unpackPos(v uint64) uint64  { return v & positionMask }
 func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
 
+// deletedFileHeaderSize is the size of the header in deletedFile.
+// Byte 0: recordMode flag, Bytes 1-7: reserved.
+const deletedFileHeaderSize = 8
+
 // Forest is a Utreexo accumulator backed by a contiguous file.
 // All nodes are stored at position-based offsets (position * 32 bytes).
 // Deleted leaves remain in the file for Undo support.
@@ -37,7 +41,7 @@ func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
 // This is set at creation time based on expected maximum leaves.
 type Forest struct {
 	file         io.ReadWriteSeeker
-	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions
+	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions + recordMode header
 	addIndexFile io.ReadWriteSeeker // stores int32 addIndex at offset pos*4
 	NumLeaves    uint64
 	forestRows   uint8 // Fixed maximum rows for stable position mapping
@@ -51,18 +55,27 @@ type Forest struct {
 	// This is persisted to deletedFile so that on restart we don't re-add
 	// deleted leaves to the positionMap.
 	deletedLeafPositions map[uint64]struct{}
+
+	// recordMode is true after Record is called but before HashAll completes.
+	// Calling Modify while in record mode would corrupt the tree.
+	// Persisted to deletedFile header (byte 0).
+	recordMode bool
 }
 
 // NewForest creates a new Forest backed by the given file.
 // The file should be an io.ReadWriteSeeker (e.g., *os.File).
-// deletedFile tracks deleted leaf positions (can be nil for new forests).
-// addIndexFile stores the addIndex for each leaf (can be nil if TTLs not needed).
+// deletedFile tracks deleted leaf positions and stores the recordMode flag in its header.
+// addIndexFile stores the addIndex for each leaf.
 // numLeaves indicates how many leaves have already been added (0 for new forest).
 // forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
 //
 // If numLeaves > 0, the positionMap is rebuilt by reading all leaf hashes from
 // the file, skipping positions recorded in deletedFile.
 func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uint64, forestRows uint8) (*Forest, error) {
+	if deletedFile == nil || file == nil || addIndexFile == nil {
+		return nil, fmt.Errorf("one of the given files are nil")
+	}
+
 	f := &Forest{
 		file:                 file,
 		deletedFile:          deletedFile,
@@ -73,11 +86,9 @@ func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uin
 		deletedLeafPositions: make(map[uint64]struct{}),
 	}
 
-	// Rebuild deletedLeafPositions from deletedFile
-	if deletedFile != nil {
-		if err := f.loadDeletedPositions(); err != nil {
-			return nil, fmt.Errorf("load deleted positions: %w", err)
-		}
+	// Rebuild deletedLeafPositions and recordMode from deletedFile
+	if err := f.loadDeletedPositions(); err != nil {
+		return nil, fmt.Errorf("load deleted positions: %w", err)
 	}
 
 	// Rebuild positionMap from existing leaves, skipping deleted positions
@@ -102,8 +113,8 @@ func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uin
 	return f, nil
 }
 
-// loadDeletedPositions reads all deleted leaf positions from the deletedFile.
-// Each position is stored as a little-endian uint64 (8 bytes).
+// loadDeletedPositions reads the header and all deleted leaf positions from deletedFile.
+// File format: [8-byte header: byte 0 = recordMode, bytes 1-7 reserved][uint64 positions...]
 func (f *Forest) loadDeletedPositions() error {
 	// Get file size first
 	size, err := f.deletedFile.Seek(0, io.SeekEnd)
@@ -111,18 +122,33 @@ func (f *Forest) loadDeletedPositions() error {
 		return err
 	}
 
-	numEntries := size / 8
-	if numEntries == 0 {
-		return nil
+	if size == 0 {
+		// Empty file, initialize header
+		return f.saveRecordMode()
 	}
 
-	// Seek back to start
+	// Seek back to start and read header
 	_, err = f.deletedFile.Seek(0, io.SeekStart)
 	if err != nil {
 		return err
 	}
 
-	// Read all entries
+	// Read recordMode from byte 0
+	var mode byte
+	err = binary.Read(f.deletedFile, binary.LittleEndian, &mode)
+	if err != nil {
+		return err
+	}
+	f.recordMode = mode != 0
+
+	// Skip rest of header
+	_, err = f.deletedFile.Seek(deletedFileHeaderSize, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	// Read all deleted position entries
+	numEntries := (size - deletedFileHeaderSize) / 8
 	for i := int64(0); i < numEntries; i++ {
 		var pos uint64
 		err := binary.Read(f.deletedFile, binary.LittleEndian, &pos)
@@ -135,12 +161,24 @@ func (f *Forest) loadDeletedPositions() error {
 	return nil
 }
 
-// recordDeletedPosition appends a deleted leaf position to the deletedFile.
-func (f *Forest) recordDeletedPosition(pos uint64) error {
-	if f.deletedFile == nil {
-		return nil
+// saveRecordMode writes the recordMode to deletedFile header (byte 0).
+func (f *Forest) saveRecordMode() error {
+	_, err := f.deletedFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
 	}
 
+	// Write 8-byte header (recordMode in byte 0, rest reserved)
+	var header [deletedFileHeaderSize]byte
+	if f.recordMode {
+		header[0] = 1
+	}
+	_, err = f.deletedFile.Write(header[:])
+	return err
+}
+
+// recordDeletedPosition appends a deleted leaf position to the deletedFile.
+func (f *Forest) recordDeletedPosition(pos uint64) error {
 	// Seek to end of file
 	_, err := f.deletedFile.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -153,7 +191,7 @@ func (f *Forest) recordDeletedPosition(pos uint64) error {
 // popDeletedPositions reads and removes the last n positions from deletedFile.
 // Returns positions in the order they were deleted (oldest first for the popped batch).
 func (f *Forest) popDeletedPositions(n int) ([]uint64, error) {
-	if f.deletedFile == nil || n == 0 {
+	if n == 0 {
 		return nil, nil
 	}
 
@@ -163,7 +201,8 @@ func (f *Forest) popDeletedPositions(n int) ([]uint64, error) {
 		return nil, err
 	}
 
-	totalEntries := endOffset / 8
+	// Account for header when calculating entries
+	totalEntries := (endOffset - deletedFileHeaderSize) / 8
 	if int64(n) > totalEntries {
 		return nil, fmt.Errorf("popDeletedPositions: requested %d but only %d recorded", n, totalEntries)
 	}
@@ -247,12 +286,7 @@ func (f *Forest) writeHash(position uint64, hash Hash) error {
 }
 
 // readAddIndex reads the addIndex for the leaf at the given position.
-// Returns -1 if addIndexFile is nil.
 func (f *Forest) readAddIndex(pos uint64) (int32, error) {
-	if f.addIndexFile == nil {
-		return -1, nil
-	}
-
 	offset := int64(pos * 4)
 	_, err := f.addIndexFile.Seek(offset, io.SeekStart)
 	if err != nil {
@@ -270,10 +304,6 @@ func (f *Forest) readAddIndex(pos uint64) (int32, error) {
 
 // writeAddIndex writes the addIndex for the leaf at the given position.
 func (f *Forest) writeAddIndex(pos uint64, addIndex int32) error {
-	if f.addIndexFile == nil {
-		return nil
-	}
-
 	offset := int64(pos * 4)
 	_, err := f.addIndexFile.Seek(offset, io.SeekStart)
 	if err != nil {
@@ -625,6 +655,9 @@ func (f *Forest) GetHash(position uint64) Hash {
 // Undo reverts a modification done by Modify.
 // This implements the Utreexo interface.
 func (f *Forest) Undo(prevAdds []Hash, proof Proof, delHashes, prevRoots []Hash) error {
+	if f.recordMode {
+		return fmt.Errorf("cannot call Undo while in record mode; call HashAll first")
+	}
 	return f.undoInternal(uint64(len(prevAdds)), len(delHashes))
 }
 
@@ -839,6 +872,10 @@ func (f *Forest) rehashToRootFromPos(pos uint64) error {
 // Modify adds and deletes elements from the forest.
 // This implements the Utreexo interface.
 func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
+	if f.recordMode {
+		return fmt.Errorf("cannot call Modify while in record mode; call HashAll first")
+	}
+
 	// Delete first.
 	if len(delHashes) > 0 {
 		err := f.delete(delHashes)
@@ -862,6 +899,10 @@ func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
 // the addIndex for each deleted leaf. This allows computing TTL (time-to-live)
 // for deleted leaves. Returns -1 for leaves added via Ingest or without TTL tracking.
 func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, error) {
+	if f.recordMode {
+		return nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
+	}
+
 	// Collect addIndexes before deletion
 	addIndexes := make([]int32, 0, len(delHashes))
 	for _, delHash := range delHashes {
@@ -889,6 +930,116 @@ func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]
 	}
 
 	return addIndexes, nil
+}
+
+// Record adds and deletes elements without computing parent hashes.
+// Use during IBD for performance - call HashAll() when done to build the tree.
+// This is equivalent to Modify but defers all hashing until HashAll().
+// Returns the addIndexes for deleted leaves (for TTL tracking).
+func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, error) {
+	// Collect addIndexes and track deletions
+	addIndexes := make([]int32, 0, len(delHashes))
+	for _, delHash := range delHashes {
+		packed, found := f.positionMap[delHash.mini()]
+		if !found {
+			return nil, fmt.Errorf("delhash %v not found in position map", delHash)
+		}
+		addIndexes = append(addIndexes, unpackIndex(packed))
+		leafPos := unpackPos(packed)
+
+		if err := f.recordDeletedPosition(leafPos); err != nil {
+			return nil, fmt.Errorf("record deleted position %d: %w", leafPos, err)
+		}
+		f.deletedLeafPositions[leafPos] = struct{}{}
+	}
+
+	// Store leaves without computing parent hashes
+	for i, hash := range adds {
+		if hash != empty {
+			f.positionMap[hash.mini()] = packPosIndex(f.NumLeaves, int32(i))
+		}
+
+		// Always write the leaf hash (even if empty, so HashAll can read it)
+		err := f.writeHash(f.NumLeaves, hash)
+		if err != nil {
+			return nil, fmt.Errorf("write leaf: %w", err)
+		}
+
+		// Write the addIndex
+		err = f.writeAddIndex(f.NumLeaves, int32(i))
+		if err != nil {
+			return nil, fmt.Errorf("write addIndex: %w", err)
+		}
+
+		f.NumLeaves++
+	}
+
+	f.recordMode = true
+	if err := f.saveRecordMode(); err != nil {
+		return nil, fmt.Errorf("save record mode: %w", err)
+	}
+	return addIndexes, nil
+}
+
+// HashAll computes all parent hashes after Record calls are complete.
+// This builds the complete tree by iterating through all leaves and
+// treating deleted positions as empty (causing siblings to move up).
+func (f *Forest) HashAll() error {
+	totalLeaves := f.NumLeaves
+
+	// Reset to rebuild from scratch
+	f.NumLeaves = 0
+
+	for pos := uint64(0); pos < totalLeaves; pos++ {
+		var hash Hash
+		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+			hash = empty
+		} else {
+			var err error
+			hash, err = f.readHash(pos)
+			if err != nil {
+				return fmt.Errorf("read leaf at %d: %w", pos, err)
+			}
+		}
+
+		// Compute parent hashes (same logic as add but without writing leaf)
+		currentHash := hash
+		currentPos := f.NumLeaves
+
+		for h := uint8(0); (f.NumLeaves>>h)&1 == 1; h++ {
+			rootPos := rootPosition(f.NumLeaves, h, f.forestRows)
+
+			rootHash, err := f.readHash(rootPos)
+			if err != nil {
+				return fmt.Errorf("read root at row %d: %w", h, err)
+			}
+
+			// Check if this root is a deleted leaf - treat as empty if so
+			if _, deleted := f.deletedLeafPositions[rootPos]; deleted {
+				rootHash = empty
+			}
+
+			parentPos := Parent(currentPos, f.forestRows)
+			newHash := parentHash(rootHash, currentHash)
+
+			err = f.writeHash(parentPos, newHash)
+			if err != nil {
+				return fmt.Errorf("write parent at position %d: %w", parentPos, err)
+			}
+
+			currentHash = newHash
+			currentPos = parentPos
+		}
+
+		f.NumLeaves++
+	}
+
+	f.recordMode = false
+	if err := f.saveRecordMode(); err != nil {
+		return fmt.Errorf("save record mode: %w", err)
+	}
+
+	return nil
 }
 
 // calculatePosition calculates the logical position of the given hash.
