@@ -65,15 +65,30 @@ type Forest struct {
 // NewForest creates a new Forest backed by the given file.
 // The file should be an io.ReadWriteSeeker (e.g., *os.File).
 // deletedFile tracks deleted leaf positions and stores the recordMode flag in its header.
-// addIndexFile stores the addIndex for each leaf.
-// numLeaves indicates how many leaves have already been added (0 for new forest).
+// addIndexFile stores the addIndex for each leaf; its size determines numLeaves (size / 4).
 // forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
 //
-// If numLeaves > 0, the positionMap is rebuilt by reading all leaf hashes from
-// the file, skipping positions recorded in deletedFile.
-func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uint64, forestRows uint8) (*Forest, error) {
+// The positionMap is rebuilt by reading all leaf hashes from the file, skipping positions recorded in deletedFile.
+func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, forestRows uint8) (*Forest, error) {
 	if deletedFile == nil || file == nil || addIndexFile == nil {
 		return nil, fmt.Errorf("one of the given files are nil")
+	}
+
+	// Derive numLeaves from addIndexFile size (each leaf stores a 4-byte int32).
+	addIdxSize, err := addIndexFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("get addIndexFile size: %w", err)
+	}
+	numLeaves := uint64(addIdxSize / 4)
+
+	// Derive deleted count from deletedFile size (8-byte header + 8 bytes per entry).
+	delSize, err := deletedFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("get deletedFile size: %w", err)
+	}
+	var numDeleted int64
+	if delSize > deletedFileHeaderSize {
+		numDeleted = (delSize - deletedFileHeaderSize) / 8
 	}
 
 	f := &Forest{
@@ -82,8 +97,8 @@ func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, numLeaves uin
 		addIndexFile:         addIndexFile,
 		NumLeaves:            numLeaves,
 		forestRows:           forestRows,
-		positionMap:          make(map[miniHash]uint64, 2<<forestRows),
-		deletedLeafPositions: make(map[uint64]struct{}),
+		positionMap:          make(map[miniHash]uint64, numLeaves),
+		deletedLeafPositions: make(map[uint64]struct{}, numDeleted),
 	}
 
 	// Rebuild deletedLeafPositions and recordMode from deletedFile

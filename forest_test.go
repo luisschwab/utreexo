@@ -124,7 +124,7 @@ func compareRoots(t *testing.T, forest *Forest, pollard Pollard, context string)
 func TestForestString(t *testing.T) {
 	file := newMemFile()
 	// Use small forestRows for visualization
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 0, 3)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), 3)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestForestString(t *testing.T) {
 // TestForestSanityCheck tests that sanityCheck catches inconsistencies.
 func TestForestSanityCheck(t *testing.T) {
 	file := newMemFile()
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 0, 10)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -392,7 +392,7 @@ func FuzzForestChain(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 0, 16)
+		forest, err := NewForest(memFile, delFile, newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,13 +476,13 @@ func FuzzForestRecord(f *testing.F) {
 		sc := newSimChainWithSeed(duration, seed)
 
 		// Forest using normal Modify
-		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 16)
+		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Forest using Record + HashAll
-		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 16)
+		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -586,7 +586,7 @@ func FuzzTreeBuilding(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 0, 17)
+		forest, err := NewForest(memFile, delFile, newMemFile(), 17)
 		if err != nil {
 			t.Fatal(err)
 		}

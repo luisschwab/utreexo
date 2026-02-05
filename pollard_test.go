@@ -183,7 +183,7 @@ func testUndo(t *testing.T, utreexo UtreexoTest) {
 			utreexo = &v
 		case *Forest:
 			undoFile := newMemFile()
-			f, err := NewForest(newMemFile(), undoFile, newMemFile(), 0, 6)
+			f, err := NewForest(newMemFile(), undoFile, newMemFile(), 6)
 			if err != nil {
 				t.Fatalf("NewForest: %v", err)
 			}
@@ -506,7 +506,7 @@ func TestModify(t *testing.T) {
 	mpFull := NewMapPollard(true)
 	testModify(t, &mpFull)
 
-	forest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 10)
+	forest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -895,7 +895,7 @@ func fuzzUndo(t *testing.T, p UtreexoTest, startLeaves uint8, modifyAdds uint8, 
 		v := NewMapPollard(false)
 		p = &v
 	case *Forest:
-		v, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 20)
+		v, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 20)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1095,7 +1095,7 @@ func FuzzUndoChain(f *testing.F) {
 			p := NewMapPollard(false)
 			fuzzUndoChain(t, &p, numBlocks, numAdds, duration, seed)
 		case 2:
-			p, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 0, 17)
+			p, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 17)
 			if err != nil {
 				t.Fatal(err)
 			}
