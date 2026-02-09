@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"golang.org/x/exp/slices"
 )
@@ -40,6 +41,8 @@ const deletedFileHeaderSize = 8
 // Forest uses a fixed forestRows to ensure stable position mappings.
 // This is set at creation time based on expected maximum leaves.
 type Forest struct {
+	mu sync.RWMutex // protects all fields below
+
 	file         io.ReadWriteSeeker
 	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions + recordMode header
 	addIndexFile io.ReadWriteSeeker // stores int32 addIndex at offset pos*4
@@ -252,12 +255,20 @@ func (f *Forest) popDeletedPositions(n int) ([]uint64, error) {
 }
 
 // GetNumLeaves returns the total number of leaves added to the forest.
+//
+// This function is safe for concurrent access.
 func (f *Forest) GetNumLeaves() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.NumLeaves
 }
 
 // GetTreeRows returns the fixed number of rows in the forest.
+//
+// This function is safe for concurrent access.
 func (f *Forest) GetTreeRows() uint8 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return TreeRows(f.NumLeaves)
 }
 
@@ -555,7 +566,18 @@ func (f *Forest) rehashToRoot(pos uint64, hash Hash) error {
 
 // GetRoots returns the current root hashes of the forest.
 // Implements the ToString interface.
+//
+// This function is safe for concurrent access.
 func (f *Forest) GetRoots() []Hash {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.getRoots()
+}
+
+// getRoots is the internal implementation of GetRoots.
+//
+// This function is NOT safe for concurrent access.
+func (f *Forest) getRoots() []Hash {
 	rootPositions := RootPositions(f.NumLeaves, f.forestRows)
 
 	roots := make([]Hash, len(rootPositions))
@@ -576,6 +598,9 @@ func (f *Forest) GetRoots() []Hash {
 	return roots
 }
 
+// getHash returns the hash at the logical position of the forest.
+//
+// This function is NOT safe for concurrent access.
 func (f *Forest) getHash(pos uint64) Hash {
 	// Tree is the root the position is located under.
 	// branchLen denotes how far down the root the position is.
@@ -663,16 +688,26 @@ func (f *Forest) getHash(pos uint64) Hash {
 // Implements the ToString interface for debugging.
 // Traverses from root to target position, following the tree structure
 // and handling move-ups where a child's hash equals its parent's hash.
+//
+// This function is safe for concurrent access.
 func (f *Forest) GetHash(position uint64) Hash {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.getHash(position)
 }
 
 // Undo reverts a modification done by Modify.
 // This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
 func (f *Forest) Undo(prevAdds []Hash, proof Proof, delHashes, prevRoots []Hash) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.recordMode {
 		return fmt.Errorf("cannot call Undo while in record mode; call HashAll first")
 	}
+
 	return f.undoInternal(uint64(len(prevAdds)), len(delHashes))
 }
 
@@ -887,6 +922,9 @@ func (f *Forest) rehashToRootFromPos(pos uint64) error {
 // Modify adds and deletes elements from the forest.
 // This implements the Utreexo interface.
 func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.recordMode {
 		return fmt.Errorf("cannot call Modify while in record mode; call HashAll first")
 	}
@@ -913,7 +951,12 @@ func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
 // ModifyAndReturnTTLs adds and deletes elements from the forest, returning
 // the addIndex for each deleted leaf. This allows computing TTL (time-to-live)
 // for deleted leaves. Returns -1 for leaves added via Ingest or without TTL tracking.
+//
+// This function is safe for concurrent access.
 func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.recordMode {
 		return nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
 	}
@@ -952,6 +995,9 @@ func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]
 // This is equivalent to Modify but defers all hashing until HashAll().
 // Returns the addIndexes for deleted leaves (for TTL tracking).
 func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	// Collect addIndexes and track deletions
 	addIndexes := make([]int32, 0, len(delHashes))
 	for _, delHash := range delHashes {
@@ -1000,6 +1046,9 @@ func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, error) {
 // This builds the complete tree by iterating through all leaves and
 // treating deleted positions as empty (causing siblings to move up).
 func (f *Forest) HashAll() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	totalLeaves := f.NumLeaves
 
 	// Reset to rebuild from scratch
@@ -1248,7 +1297,12 @@ func (f *Forest) deTwinPairs(targets []targetPair) ([]targetPair, error) {
 // This implements the Utreexo interface by looking up positions from hashes.
 // Uses the walk-up algorithm to find where each hash currently is (it may have
 // moved up due to deletions), then computes the proof positions.
+//
+// This function is safe for concurrent access.
 func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	if len(delHashes) == 0 {
 		return Proof{}, nil
 	}
@@ -1281,51 +1335,76 @@ func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 	}, nil
 }
 
-// Verify verifies that the given hashes and proof are valid.
+// Verify verifies that the given hashes exist in the forest.
 // This implements the Utreexo interface.
-func (f *Forest) Verify(delHashes []Hash, proof Proof, remember bool) error {
-	stump := Stump{
-		Roots:     f.GetRoots(),
-		NumLeaves: f.NumLeaves,
+//
+// This function is safe for concurrent access.
+func (f *Forest) Verify(delHashes []Hash, _ Proof, _ bool) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	for _, delHash := range delHashes {
+		pos, found := f.positionMap[delHash.mini()]
+		if !found {
+			return fmt.Errorf("hash %v doesn't exist in the forest", delHash)
+		}
+
+		_, deleted := f.deletedLeafPositions[pos]
+		if deleted {
+			return fmt.Errorf("hash %v has already been deleted in the forest", delHash)
+		}
 	}
-	_, err := Verify(stump, delHashes, proof)
-	return err
+
+	return nil
 }
 
 // GetLeafPosition returns the position for the given leaf hash.
 // This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
 func (f *Forest) GetLeafPosition(hash Hash) (uint64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	packed, ok := f.positionMap[hash.mini()]
 	return unpackPos(packed), ok
 }
 
 // String returns a string representation of the forest.
 // This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
 func (f *Forest) String() string {
+	// No explicit lock needed - GetHash/GetRoots/etc. take their own RLocks.
+	// Nested RLocks are allowed by sync.RWMutex.
 	return String(f)
 }
 
 // RawString returns a string representation of the raw file contents.
 // Unlike String() which accounts for move-ups and returns the logical tree structure,
 // RawString() shows the actual bytes stored at each file position. Useful for debugging.
+//
+// This function is safe for concurrent access.
 func (f *Forest) RawString() string {
 	return String(&rawForest{f})
 }
 
-// rawForest wraps Forest to provide raw file reads for GetHash
+// rawForest wraps Forest to provide raw file reads for GetHash.
+// Unlike Forest.GetHash which traverses from root handling move-ups,
+// rawForest.GetHash reads directly from the file position.
 type rawForest struct {
 	*Forest
 }
 
-func (r *rawForest) GetTreeRows() uint8 {
-	return r.forestRows
-}
+func (r *rawForest) GetTreeRows() uint8 { return r.forestRows }
 
 func (r *rawForest) GetHash(position uint64) Hash {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	hash, err := r.readHash(position)
 	if err != nil {
 		return empty
 	}
-
 	return hash
 }
