@@ -1,5 +1,9 @@
 // Package sizehelper provides functions to calculate memory usage of Go's internal
 // swissmap implementation on 64-bit systems.
+//
+// IMPORTANT: These calculations are only accurate for Go 1.25.
+// Other Go versions may use different map implementations.
+//
 // Based on Go 1.25 runtime/internal/maps source code.
 package sizehelper
 
