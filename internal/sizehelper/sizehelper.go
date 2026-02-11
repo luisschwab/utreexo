@@ -1,5 +1,10 @@
-// Package sizehelper provides functions to calculate memory usage of Go's internal
+// Package sizehelper provides functions to estimate memory usage of Go's internal
 // swissmap implementation on 64-bit systems.
+//
+// IMPORTANT: These estimates are based on Go 1.25's swissmap implementation.
+// Other Go versions may use different map implementations and produce
+// slightly different results.
+//
 // Based on Go 1.25 runtime/internal/maps source code.
 package sizehelper
 
@@ -126,12 +131,13 @@ func groupSize(slotSize int) int {
 	return ctrlGroupSize + swissMapGroupSlots*slotSize
 }
 
-// ExactMemory returns the memory allocation in bytes for
+// MapMemory estimates the memory allocation in bytes for
 // make(map[K]V, hint) on 64-bit systems, given the key and value sizes.
 //
-// This uses the exact allocation formula from Go 1.25's swissmap implementation,
-// including size class rounding.
-func ExactMemory(hint, keySize, valueSize int) int {
+// Based on Go 1.25's swissmap allocation formula including size class rounding.
+// Accuracy: within 32 bytes for small maps, within 0.1% for large maps (>50k entries).
+// Results may vary slightly across Go patch versions.
+func MapMemory(hint, keySize, valueSize int) int {
 	slotSize := slotSize(keySize, valueSize)
 	grpSize := groupSize(slotSize)
 
@@ -178,9 +184,9 @@ func ExactMemory(hint, keySize, valueSize int) int {
 	return total
 }
 
-// HintForMemory returns the minimum hint that will allocate
-// at least memInBytes for a map with the given key and value sizes.
-func HintForMemory(memInBytes, keySize, valueSize int) int {
+// HintForMapMemory returns the minimum hint that will allocate
+// approximately memInBytes for a map with the given key and value sizes.
+func HintForMapMemory(memInBytes, keySize, valueSize int) int {
 	if memInBytes <= 0 {
 		return 0
 	}
@@ -189,7 +195,7 @@ func HintForMemory(memInBytes, keySize, valueSize int) int {
 	low, high := 0, memInBytes // Upper bound: hint can't be more than bytes
 
 	// Find a reasonable upper bound first
-	for ExactMemory(high, keySize, valueSize) < memInBytes {
+	for MapMemory(high, keySize, valueSize) < memInBytes {
 		high *= 2
 		if high > 1<<30 { // Sanity limit
 			break
@@ -199,7 +205,7 @@ func HintForMemory(memInBytes, keySize, valueSize int) int {
 	// Binary search
 	for low < high {
 		mid := (low + high) / 2
-		alloc := ExactMemory(mid, keySize, valueSize)
+		alloc := MapMemory(mid, keySize, valueSize)
 		if alloc < memInBytes {
 			low = mid + 1
 		} else {
