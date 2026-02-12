@@ -164,6 +164,13 @@ func testUndo(t *testing.T, utreexo UtreexoTest) {
 			[]Hash{{16}},
 			[]Hash{},
 		},
+		{
+			[]Hash{{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}, {11}, {12}, {13}, {14}, {15}, {16}},
+			[]Hash{{9}, {10}, {11}, {12}, {14}},
+
+			nil,
+			[]Hash{{15}},
+		},
 	}
 
 	for i, test := range tests {
@@ -174,6 +181,13 @@ func testUndo(t *testing.T, utreexo UtreexoTest) {
 		case *MapPollard:
 			v := NewMapPollard(false)
 			utreexo = &v
+		case *Forest:
+			undoFile := newMemFile()
+			f, err := NewForest(newMemFile(), undoFile, newMemFile(), 6)
+			if err != nil {
+				t.Fatalf("NewForest: %v", err)
+			}
+			utreexo = f
 		}
 		adds := make([]Leaf, len(test.startAdds))
 		for i := range adds {
@@ -285,6 +299,7 @@ func TestUndo(t *testing.T) {
 
 	testUndo(t, &Pollard{})
 	testUndo(t, &MapPollard{})
+	testUndo(t, &Forest{})
 }
 
 // checkHashes moves down the tree and calculates the parent hash from the children.
@@ -490,6 +505,12 @@ func TestModify(t *testing.T) {
 
 	mpFull := NewMapPollard(true)
 	testModify(t, &mpFull)
+
+	forest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 10)
+	if err != nil {
+		t.Fatalf("NewForest: %v", err)
+	}
+	testModify(t, forest)
 }
 
 // simChain is for testing; it spits out "blocks" of adds and deletes
@@ -855,6 +876,7 @@ func FuzzUndo(f *testing.F) {
 
 		fuzzUndo(t, &Pollard{}, startLeaves, modifyAdds, delCount)
 		fuzzUndo(t, &MapPollard{}, startLeaves, modifyAdds, delCount)
+		fuzzUndo(t, &Forest{}, startLeaves, modifyAdds, delCount)
 	})
 }
 
@@ -864,7 +886,7 @@ func fuzzUndo(t *testing.T, p UtreexoTest, startLeaves uint8, modifyAdds uint8, 
 		return
 	}
 
-	// Create the starting off pollard.
+	// Create the starting off accumulator.
 	switch p.(type) {
 	case *Pollard:
 		v := NewAccumulator()
@@ -872,6 +894,12 @@ func fuzzUndo(t *testing.T, p UtreexoTest, startLeaves uint8, modifyAdds uint8, 
 	case *MapPollard:
 		v := NewMapPollard(false)
 		p = &v
+	case *Forest:
+		v, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p = v
 	}
 	// Create the starting off pollard.
 	leaves, dels, _ := getAddsAndDels(uint32(p.GetNumLeaves()), uint32(startLeaves), uint32(delCount))
@@ -1057,14 +1085,21 @@ func FuzzUndoChain(f *testing.F) {
 			numBlocks = 50
 		}
 
-		// Only run either or since if we run both the fuzz test will give process
+		// Only run one implementation since running all will give process
 		// hung or terminated unexpectedly error.
-		if numAdds&1 == 1 {
+		switch numAdds % 3 {
+		case 0:
 			p := NewAccumulator()
 			fuzzUndoChain(t, &p, numBlocks, numAdds, duration, seed)
-		} else {
-			p1 := NewMapPollard(false)
-			fuzzUndoChain(t, &p1, numBlocks, numAdds, duration, seed)
+		case 1:
+			p := NewMapPollard(false)
+			fuzzUndoChain(t, &p, numBlocks, numAdds, duration, seed)
+		case 2:
+			p, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 17)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fuzzUndoChain(t, p, numBlocks, numAdds, duration, seed)
 		}
 	})
 }
@@ -1114,7 +1149,7 @@ func fuzzUndoChain(t *testing.T, p UtreexoTest, blockCount, numAdds, duration ui
 
 			if gotHash != delHashes[i] {
 				t.Fatalf("FuzzUndoChain fail at block %d. For pos %d, expected %s, got %s",
-					b, i, delHashes[i], gotHash)
+					b, bp.Targets[i], delHashes[i], gotHash)
 			}
 		}
 

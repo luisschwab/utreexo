@@ -1054,6 +1054,15 @@ func FuzzMapPollardTTLs(f *testing.F) {
 
 		m := NewMapPollard(true)
 
+		// Create forest with addIndexFile for TTL tracking
+		memFile := newMemFile()
+		delFile := newMemFile()
+		addIndexFile := newMemFile()
+		forest, err := NewForest(memFile, delFile, addIndexFile, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		leafMap := make(map[Hash]int32, 50*numAdds)
 
 		var totalAdds, totalDels int
@@ -1079,6 +1088,13 @@ func FuzzMapPollardTTLs(f *testing.F) {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Error: %v", b, err)
 			}
 
+			// Forest should return the same addIndexes
+			forestIndex, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
+			if err != nil {
+				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
+			}
+			require.Equal(t, createIndex, forestIndex, "block %d: forest addIndexes don't match mappollard", b)
+
 			for i, delHash := range delHashes {
 				ttlInfo, found := leafMap[delHash]
 				if !found {
@@ -1102,12 +1118,23 @@ func FuzzMapPollardTTLs(f *testing.F) {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Error: %v", b, err)
 			}
 
+			err = forest.Undo(addHashes, proof, delHashes, origRoots)
+			if err != nil {
+				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
+			}
+
 			gotIndex, err := m.ModifyAndReturnTTLs(adds, delHashes, proof)
 			if err != nil {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Error: %v", b, err)
 			}
 
 			require.Equal(t, createIndex, gotIndex)
+
+			gotForestIndex, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
+			if err != nil {
+				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
+			}
+			require.Equal(t, createIndex, gotForestIndex, "block %d: forest addIndexes don't match mappollard", b)
 		}
 	})
 }
