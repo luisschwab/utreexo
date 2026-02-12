@@ -118,6 +118,31 @@ func TestHintForMapMemory(t *testing.T) {
 	if hintLargeValue >= hintSmallValue {
 		t.Errorf("Larger value size should give smaller hint: got %d >= %d", hintLargeValue, hintSmallValue)
 	}
+
+	// Verify hint-1 produces less memory (but not necessarily half -
+	// only halves at certain capacity boundaries)
+	memTargets := []int{1000, 5000, 10000, 50000, 100000, 1000000, 10000000, 100000000}
+	keySizes := []int{1, 4, 8}
+	valueSizes := []int{1, 4, 8, 16, 32}
+
+	for _, target := range memTargets {
+		for _, keySize := range keySizes {
+			for _, valueSize := range valueSizes {
+				hint := HintForMapMemory(target, keySize, valueSize)
+				if hint <= 1 {
+					continue // skip edge cases
+				}
+
+				mem := MapMemory(hint, keySize, valueSize)
+				memMinus1 := MapMemory(hint-1, keySize, valueSize)
+
+				if memMinus1 >= mem {
+					t.Errorf("hint-1 should produce less memory: target=%d, key=%d, val=%d, hint=%d, mem=%d, memMinus1=%d",
+						target, keySize, valueSize, hint, mem, memMinus1)
+				}
+			}
+		}
+	}
 }
 
 // TestHintForMapMemoryVsRuntime compares predictions against actual runtime allocations
@@ -303,6 +328,89 @@ func TestHintFor30GB(t *testing.T) {
 
 			if predicted < target {
 				t.Errorf("predicted %d < target %d", predicted, target)
+			}
+		})
+	}
+}
+
+// TestCalcNumEntries verifies that CalcNumEntries correctly distributes
+// entries across multiple maps while staying within the memory budget.
+func TestCalcNumEntries(t *testing.T) {
+	testCases := []struct {
+		name           string
+		keySize        int
+		valueSize      int
+		maxMemoryUsage int64
+	}{
+		// map[int]int (slotSize=16)
+		{"map[int]int_1MB", 8, 8, 1024 * 1024},
+		{"map[int]int_10MB", 8, 8, 10 * 1024 * 1024},
+		{"map[int]int_100MB", 8, 8, 100 * 1024 * 1024},
+		{"map[int]int_1GB", 8, 8, 1024 * 1024 * 1024},
+		{"map[int]int_10GB", 8, 8, 10 * 1024 * 1024 * 1024},
+
+		// map[uint32]uint32 (slotSize=8)
+		{"map[uint32]uint32_1MB", 4, 4, 1024 * 1024},
+		{"map[uint32]uint32_100MB", 4, 4, 100 * 1024 * 1024},
+		{"map[uint32]uint32_1GB", 4, 4, 1024 * 1024 * 1024},
+		{"map[uint32]uint32_10GB", 4, 4, 10 * 1024 * 1024 * 1024},
+
+		// map[uint64][32]byte (slotSize=40)
+		{"map[uint64][32]byte_10MB", 8, 32, 10 * 1024 * 1024},
+		{"map[uint64][32]byte_100MB", 8, 32, 100 * 1024 * 1024},
+		{"map[uint64][32]byte_1GB", 8, 32, 1024 * 1024 * 1024},
+		{"map[uint64][32]byte_10GB", 8, 32, 10 * 1024 * 1024 * 1024},
+
+		// map[byte]byte (slotSize=2)
+		{"map[byte]byte_1MB", 1, 1, 1024 * 1024},
+		{"map[byte]byte_10MB", 1, 1, 10 * 1024 * 1024},
+		{"map[byte]byte_100MB", 1, 1, 100 * 1024 * 1024},
+		{"map[byte]byte_1GB", 1, 1, 1024 * 1024 * 1024},
+		{"map[byte]byte_10GB", 1, 1, 10 * 1024 * 1024 * 1024},
+
+		// map[int][16]byte (slotSize=24)
+		{"map[int][16]byte_10MB", 8, 16, 10 * 1024 * 1024},
+		{"map[int][16]byte_1GB", 8, 16, 1024 * 1024 * 1024},
+		{"map[int][16]byte_10GB", 8, 16, 10 * 1024 * 1024 * 1024},
+
+		// map[int][24]byte (slotSize=32)
+		{"map[int][24]byte_10MB", 8, 24, 10 * 1024 * 1024},
+		{"map[int][24]byte_1GB", 8, 24, 1024 * 1024 * 1024},
+		{"map[int][24]byte_10GB", 8, 24, 10 * 1024 * 1024 * 1024},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, totalCount := CalcNumEntries(tc.keySize, tc.valueSize, tc.maxMemoryUsage)
+
+			// Calculate actual memory usage
+			var totalMemory int64
+			for _, hint := range entries {
+				totalMemory += int64(MapMemory(hint, tc.keySize, tc.valueSize))
+			}
+
+			t.Logf("maxMemory=%d, maps=%d, totalEntries=%d, actualMemory=%d (%.1f%%)",
+				tc.maxMemoryUsage, len(entries), totalCount, totalMemory,
+				float64(totalMemory)/float64(tc.maxMemoryUsage)*100)
+
+			// Verify we don't exceed the budget
+			if totalMemory > tc.maxMemoryUsage {
+				t.Errorf("totalMemory %d > maxMemoryUsage %d", totalMemory, tc.maxMemoryUsage)
+			}
+
+			// Verify we're using at least 95% of the budget
+			utilization := float64(totalMemory) / float64(tc.maxMemoryUsage)
+			if utilization < 0.95 {
+				t.Errorf("memory utilization %.1f%% < 95%%, leaving too much unused", utilization*100)
+			}
+
+			// Verify entry count matches sum of hints
+			sum := 0
+			for _, e := range entries {
+				sum += e
+			}
+			if sum != totalCount {
+				t.Errorf("sum of entries %d != totalCount %d", sum, totalCount)
 			}
 		})
 	}
