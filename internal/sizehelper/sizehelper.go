@@ -215,3 +215,43 @@ func HintForMapMemory(memInBytes, keySize, valueSize int) int {
 
 	return low
 }
+
+// CalcNumEntries calculates how to distribute entries across multiple maps
+// to stay within maxMemoryUsage bytes total.
+//
+// It returns a slice of hint values for each map and the total entry count.
+// Each hint represents the number of entries to allocate for that map.
+// The maps are allocated largest-first to maximize memory utilization.
+func CalcNumEntries(keySize, valueSize int, maxMemoryUsage int64) ([]int, int) {
+	entries := []int{}
+	totalEntryCount := 0
+	totalMapSize := int64(0)
+
+	for maxMemoryUsage > totalMapSize {
+		remaining := int(maxMemoryUsage - totalMapSize)
+		hint := HintForMapMemory(remaining, keySize, valueSize)
+		if hint == 0 {
+			break
+		}
+
+		mapSize := int64(MapMemory(hint, keySize, valueSize))
+		if totalMapSize+mapSize > maxMemoryUsage {
+			// HintForMapMemory returns minimum hint producing >= remaining bytes,
+			// but we need <= remaining, so try hint-1
+			hint--
+			if hint <= 0 {
+				break
+			}
+			mapSize = int64(MapMemory(hint, keySize, valueSize))
+			if totalMapSize+mapSize > maxMemoryUsage {
+				break
+			}
+		}
+
+		totalMapSize += mapSize
+		entries = append(entries, hint)
+		totalEntryCount += hint
+	}
+
+	return entries, totalEntryCount
+}
