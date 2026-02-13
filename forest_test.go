@@ -611,3 +611,81 @@ func FuzzTreeBuilding(f *testing.F) {
 		require.Equal(t, roots, roots1)
 	})
 }
+
+// TestForestCachedRWSNoFlush verifies that when Forest is backed by cachedRWS,
+// no data is written to the underlying files until Flush is called.
+func TestForestCachedRWSNoFlush(t *testing.T) {
+	// Create the raw underlying memFiles.
+	underlyingFile := newMemFile()
+	underlyingDelFile := newMemFile()
+	underlyingAddIdxFile := newMemFile()
+
+	// Wrap each with cachedRWS so all writes are buffered.
+	cachedFile, err := newCachedRWS(underlyingFile, 32, 0)
+	require.NoError(t, err)
+	cachedDelFile, err := newCachedRWS(underlyingDelFile, 8, 0)
+	require.NoError(t, err)
+	cachedAddIdxFile, err := newCachedRWS(underlyingAddIdxFile, 4, 0)
+	require.NoError(t, err)
+
+	// Create forest backed by the cached files.
+	forest, err := NewForest(cachedFile, cachedDelFile, cachedAddIdxFile, 10)
+	require.NoError(t, err)
+
+	// Reference pollard for correctness comparison.
+	pollard := NewAccumulator()
+
+	// Add 8 leaves.
+	leaves := make([]Leaf, 8)
+	for i := range leaves {
+		leaves[i] = Leaf{Hash: testHashFromInt(i + 1)}
+	}
+	err = forest.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+	err = pollard.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+	compareRoots(t, forest, pollard, "after adds")
+
+	// Delete 2 leaves to exercise the deleted-file path as well.
+	delHashes := []Hash{leaves[0].Hash, leaves[3].Hash}
+	forestProof, err := forest.Prove(delHashes)
+	require.NoError(t, err)
+	err = forest.Modify(nil, delHashes, forestProof)
+	require.NoError(t, err)
+
+	pollardProof, err := pollard.Prove(delHashes)
+	require.NoError(t, err)
+	err = pollard.Modify(nil, delHashes, pollardProof)
+	require.NoError(t, err)
+	compareRoots(t, forest, pollard, "after deletes")
+
+	// ---- KEY CHECK: underlying files must still be empty ----
+	require.Equal(t, 0, len(underlyingFile.data),
+		"main file should be untouched before Flush")
+	require.Equal(t, 0, len(underlyingDelFile.data),
+		"deleted file should be untouched before Flush")
+	require.Equal(t, 0, len(underlyingAddIdxFile.data),
+		"addIndex file should be untouched before Flush")
+
+	// Flush all caches to the underlying files.
+	require.NoError(t, cachedFile.Flush())
+	require.NoError(t, cachedDelFile.Flush())
+	require.NoError(t, cachedAddIdxFile.Flush())
+
+	// Underlying files should now contain data.
+	require.NotEqual(t, 0, len(underlyingFile.data),
+		"main file should have data after Flush")
+	require.NotEqual(t, 0, len(underlyingDelFile.data),
+		"deleted file should have data after Flush")
+	require.NotEqual(t, 0, len(underlyingAddIdxFile.data),
+		"addIndex file should have data after Flush")
+
+	// Restart a new forest from the flushed underlying files
+	// and verify the roots still match.
+	forest2, err := NewForest(
+		underlyingFile, underlyingDelFile, underlyingAddIdxFile, 10,
+	)
+	require.NoError(t, err)
+	require.Equal(t, forest.GetRoots(), forest2.GetRoots(),
+		"roots should match after restart from flushed data")
+}
