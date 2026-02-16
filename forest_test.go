@@ -124,7 +124,7 @@ func compareRoots(t *testing.T, forest *Forest, pollard Pollard, context string)
 func TestForestString(t *testing.T) {
 	file := newMemFile()
 	// Use small forestRows for visualization
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 3)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), newMemFile(), 3)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestForestString(t *testing.T) {
 // TestForestSanityCheck tests that sanityCheck catches inconsistencies.
 func TestForestSanityCheck(t *testing.T) {
 	file := newMemFile()
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 10)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), newMemFile(), 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -242,9 +242,8 @@ func (f *Forest) sanityCheck() error {
 	if err != nil {
 		return fmt.Errorf("deletedFile seek: %w", err)
 	}
-	// Account for 8-byte header (recordMode + reserved)
-	fileEntries := (fileSize - deletedFileHeaderSize) / 8
 	mapEntries := int64(len(f.deletedLeafPositions))
+	fileEntries := fileSize / 8
 	if fileEntries != mapEntries {
 		return fmt.Errorf("deletedLeafPositions mismatch: file has %d entries, map has %d",
 			fileEntries, mapEntries)
@@ -392,7 +391,7 @@ func FuzzForestChain(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 16)
+		forest, err := NewForest(memFile, delFile, newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,13 +475,13 @@ func FuzzForestRecord(f *testing.F) {
 		sc := newSimChainWithSeed(duration, seed)
 
 		// Forest using normal Modify
-		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
+		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Forest using Record + HashAll
-		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
+		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -586,7 +585,7 @@ func FuzzTreeBuilding(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 17)
+		forest, err := NewForest(memFile, delFile, newMemFile(), newMemFile(), 17)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -619,6 +618,7 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	underlyingFile := newMemFile()
 	underlyingDelFile := newMemFile()
 	underlyingAddIdxFile := newMemFile()
+	underlyingMetaFile := newMemFile()
 
 	// Wrap each with cachedRWS so all writes are buffered.
 	cachedFile, err := newCachedRWS(underlyingFile, 32, 0)
@@ -627,9 +627,11 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	require.NoError(t, err)
 	cachedAddIdxFile, err := newCachedRWS(underlyingAddIdxFile, 4, 0)
 	require.NoError(t, err)
+	cachedMetaFile, err := newCachedRWS(underlyingMetaFile, 32, 0)
+	require.NoError(t, err)
 
 	// Create forest backed by the cached files.
-	forest, err := NewForest(cachedFile, cachedDelFile, cachedAddIdxFile, 10)
+	forest, err := NewForest(cachedFile, cachedDelFile, cachedAddIdxFile, cachedMetaFile, 10)
 	require.NoError(t, err)
 
 	// Reference pollard for correctness comparison.
@@ -683,7 +685,7 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	// Restart a new forest from the flushed underlying files
 	// and verify the roots still match.
 	forest2, err := NewForest(
-		underlyingFile, underlyingDelFile, underlyingAddIdxFile, 10,
+		underlyingFile, underlyingDelFile, underlyingAddIdxFile, underlyingMetaFile, 10,
 	)
 	require.NoError(t, err)
 	require.Equal(t, forest.GetRoots(), forest2.GetRoots(),

@@ -1058,7 +1058,7 @@ func FuzzMapPollardTTLs(f *testing.F) {
 		memFile := newMemFile()
 		delFile := newMemFile()
 		addIndexFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, addIndexFile, 16)
+		forest, err := NewForest(memFile, delFile, addIndexFile, newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
