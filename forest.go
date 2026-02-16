@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"sync"
 
 	"golang.org/x/exp/slices"
@@ -26,9 +27,58 @@ func packPosIndex(pos uint64, addIndex int32) uint64 {
 func unpackPos(v uint64) uint64  { return v & positionMask }
 func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
 
-// deletedFileHeaderSize is the size of the header in deletedFile.
-// Byte 0: recordMode flag, Bytes 1-7: reserved.
-const deletedFileHeaderSize = 8
+// deletedBitmap tracks deleted leaf positions using 1 bit per position.
+// Position N is stored at bit (N % 64) of bits[N / 64].
+// This is more memory-efficient and cache-friendly than a map.
+type deletedBitmap struct {
+	bits []uint64
+}
+
+// newDeletedBitmap creates a bitmap sized to track numLeaves positions.
+func newDeletedBitmap(numLeaves uint64) *deletedBitmap {
+	numWords := (numLeaves + 63) / 64
+	return &deletedBitmap{
+		bits: make([]uint64, numWords),
+	}
+}
+
+// set marks the given position as deleted. Grows the bitmap if needed.
+func (b *deletedBitmap) set(pos uint64) {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		newBits := make([]uint64, word+1)
+		copy(newBits, b.bits)
+		b.bits = newBits
+	}
+	b.bits[word] |= 1 << (pos % 64)
+}
+
+// unset marks the given position as not deleted.
+func (b *deletedBitmap) unset(pos uint64) {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		return
+	}
+	b.bits[word] &^= 1 << (pos % 64)
+}
+
+// isSet returns true if the given position is marked as deleted.
+func (b *deletedBitmap) isSet(pos uint64) bool {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		return false
+	}
+	return b.bits[word]&(1<<(pos%64)) != 0
+}
+
+// count returns the total number of deleted positions.
+func (b *deletedBitmap) count() int {
+	n := 0
+	for _, word := range b.bits {
+		n += bits.OnesCount64(word)
+	}
+	return n
+}
 
 // Forest is a Utreexo accumulator backed by a contiguous file.
 // All nodes are stored at position-based offsets (position * 32 bytes).
@@ -58,7 +108,7 @@ type Forest struct {
 	// deletedLeafPositions tracks which leaf positions have been deleted.
 	// This is persisted to deletedFile so that on restart we don't re-add
 	// deleted leaves to the positionMap.
-	deletedLeafPositions map[uint64]struct{}
+	deletedLeafPositions *deletedBitmap
 
 	// recordMode is true after Record is called but before HashAll completes.
 	// Calling Modify while in record mode would corrupt the tree.
@@ -100,8 +150,8 @@ func NewForest(file, deletedFile, addIndexFile, metaFile io.ReadWriteSeeker, for
 		metaFile:             metaFile,
 		NumLeaves:            numLeaves,
 		forestRows:           forestRows,
-		positionMap:          make(map[miniHash]uint64, numLeaves),
-		deletedLeafPositions: make(map[uint64]struct{}, numDeleted),
+		positionMap:          make(map[miniHash]uint64, numLeaves-numDeleted),
+		deletedLeafPositions: newDeletedBitmap(numLeaves),
 	}
 
 	// Load metadata (recordMode)
@@ -116,7 +166,7 @@ func NewForest(file, deletedFile, addIndexFile, metaFile io.ReadWriteSeeker, for
 
 	// Rebuild positionMap from existing leaves, skipping deleted positions
 	for pos := uint64(0); pos < numLeaves; pos++ {
-		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+		if f.deletedLeafPositions.isSet(pos) {
 			continue
 		}
 		hash, err := f.readHash(pos)
@@ -176,13 +226,9 @@ func (f *Forest) loadDeletedPositions() error {
 		return err
 	}
 
-	for i := int64(0); i < numEntries; i++ {
-		var pos uint64
-		err := binary.Read(f.deletedFile, binary.LittleEndian, &pos)
-		if err != nil {
-			return err
-		}
-		f.deletedLeafPositions[pos] = struct{}{}
+	for i := range numEntries {
+		pos := binary.LittleEndian.Uint64(buf[i*8:])
+		f.deletedLeafPositions.set(pos)
 	}
 
 	return nil
@@ -394,7 +440,7 @@ func (f *Forest) add(hash Hash, addIndex int32) error {
 		}
 
 		// Check if this root is a deleted leaf - treat as empty if so
-		if _, deleted := f.deletedLeafPositions[rootPos]; deleted {
+		if f.deletedLeafPositions.isSet(rootPos) {
 			rootHash = empty
 		}
 
@@ -448,7 +494,7 @@ func (f *Forest) deleteSingle(delHash Hash) error {
 	if err := f.recordDeletedPosition(leafPos); err != nil {
 		return fmt.Errorf("record deleted position %d: %w", leafPos, err)
 	}
-	f.deletedLeafPositions[leafPos] = struct{}{}
+	f.deletedLeafPositions.set(leafPos)
 
 	// First I need to check if I moved up.
 	pos := leafPos
@@ -602,7 +648,7 @@ func (f *Forest) getRoots() []Hash {
 	roots := make([]Hash, len(rootPositions))
 	for i, pos := range rootPositions {
 		// Check if this root position is a deleted leaf - return empty if so
-		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+		if f.deletedLeafPositions.isSet(pos) {
 			roots[i] = empty
 			continue
 		}
@@ -648,7 +694,7 @@ func (f *Forest) getHash(pos uint64) Hash {
 
 	// If the root is at row 0, check if it's been deleted as the hash will not be empty.
 	if DetectRow(startPos, f.forestRows) == 0 {
-		if _, deleted := f.deletedLeafPositions[startPos]; deleted {
+		if f.deletedLeafPositions.isSet(startPos) {
 			return empty
 		}
 
@@ -750,7 +796,7 @@ func (f *Forest) undoInternal(numAdds uint64, numDels int) error {
 	// Step 3: Undo deletions in reverse order (LIFO)
 	for i := len(delPositions) - 1; i >= 0; i-- {
 		pos := delPositions[i]
-		delete(f.deletedLeafPositions, pos)
+		f.deletedLeafPositions.unset(pos)
 
 		err = f.undoSingleDeletion(pos)
 		if err != nil {
@@ -1030,7 +1076,7 @@ func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, error) {
 		if err := f.recordDeletedPosition(leafPos); err != nil {
 			return nil, fmt.Errorf("record deleted position %d: %w", leafPos, err)
 		}
-		f.deletedLeafPositions[leafPos] = struct{}{}
+		f.deletedLeafPositions.set(leafPos)
 	}
 
 	// Store leaves without computing parent hashes
@@ -1075,7 +1121,7 @@ func (f *Forest) HashAll() error {
 
 	for pos := uint64(0); pos < totalLeaves; pos++ {
 		var hash Hash
-		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+		if f.deletedLeafPositions.isSet(pos) {
 			hash = empty
 		} else {
 			var err error
@@ -1098,7 +1144,7 @@ func (f *Forest) HashAll() error {
 			}
 
 			// Check if this root is a deleted leaf - treat as empty if so
-			if _, deleted := f.deletedLeafPositions[rootPos]; deleted {
+			if f.deletedLeafPositions.isSet(rootPos) {
 				rootHash = empty
 			}
 
@@ -1368,8 +1414,7 @@ func (f *Forest) Verify(delHashes []Hash, _ Proof, _ bool) error {
 			return fmt.Errorf("hash %v doesn't exist in the forest", delHash)
 		}
 
-		_, deleted := f.deletedLeafPositions[unpackPos(packed)]
-		if deleted {
+		if f.deletedLeafPositions.isSet(unpackPos(packed)) {
 			return fmt.Errorf("hash %v has already been deleted in the forest", delHash)
 		}
 	}

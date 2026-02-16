@@ -242,8 +242,8 @@ func (f *Forest) sanityCheck() error {
 	if err != nil {
 		return fmt.Errorf("deletedFile seek: %w", err)
 	}
-	mapEntries := int64(len(f.deletedLeafPositions))
 	fileEntries := fileSize / 8
+	mapEntries := int64(f.deletedLeafPositions.count())
 	if fileEntries != mapEntries {
 		return fmt.Errorf("deletedLeafPositions mismatch: file has %d entries, map has %d",
 			fileEntries, mapEntries)
@@ -274,7 +274,7 @@ func (f *Forest) sanityCheck() error {
 			continue
 		}
 		// Skip deleted positions
-		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+		if f.deletedLeafPositions.isSet(pos) {
 			continue
 		}
 
@@ -356,7 +356,7 @@ func (f *Forest) positionMapToString() string {
 			continue
 		}
 		// Skip deleted positions
-		if _, deleted := f.deletedLeafPositions[pos]; deleted {
+		if f.deletedLeafPositions.isSet(pos) {
 			continue
 		}
 		if idx != 0 {
