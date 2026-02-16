@@ -44,8 +44,9 @@ type Forest struct {
 	mu sync.RWMutex // protects all fields below
 
 	file         io.ReadWriteSeeker
-	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions + recordMode header
+	deletedFile  io.ReadWriteSeeker // separate file tracking deleted leaf positions
 	addIndexFile io.ReadWriteSeeker // stores int32 addIndex at offset pos*4
+	metaFile     io.ReadWriteSeeker // stores recordMode (bytes 0-31) + consistency hash (bytes 32-63)
 	NumLeaves    uint64
 	forestRows   uint8 // Fixed maximum rows for stable position mapping
 
@@ -61,19 +62,20 @@ type Forest struct {
 
 	// recordMode is true after Record is called but before HashAll completes.
 	// Calling Modify while in record mode would corrupt the tree.
-	// Persisted to deletedFile header (byte 0).
+	// Persisted to metaFile (bytes 0-31, padded).
 	recordMode bool
 }
 
 // NewForest creates a new Forest backed by the given file.
 // The file should be an io.ReadWriteSeeker (e.g., *os.File).
-// deletedFile tracks deleted leaf positions and stores the recordMode flag in its header.
+// deletedFile tracks deleted leaf positions (8 bytes per entry).
 // addIndexFile stores the addIndex for each leaf; its size determines numLeaves (size / 4).
+// metaFile stores recordMode (bytes 0-31) and consistency hash (bytes 32-63).
 // forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
 //
 // The positionMap is rebuilt by reading all leaf hashes from the file, skipping positions recorded in deletedFile.
-func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, forestRows uint8) (*Forest, error) {
-	if deletedFile == nil || file == nil || addIndexFile == nil {
+func NewForest(file, deletedFile, addIndexFile, metaFile io.ReadWriteSeeker, forestRows uint8) (*Forest, error) {
+	if deletedFile == nil || file == nil || addIndexFile == nil || metaFile == nil {
 		return nil, fmt.Errorf("one of the given files are nil")
 	}
 
@@ -84,27 +86,30 @@ func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, forestRows ui
 	}
 	numLeaves := uint64(addIdxSize / 4)
 
-	// Derive deleted count from deletedFile size (8-byte header + 8 bytes per entry).
+	// Derive deleted count from deletedFile size (8 bytes per entry).
 	delSize, err := deletedFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("get deletedFile size: %w", err)
 	}
-	var numDeleted int64
-	if delSize > deletedFileHeaderSize {
-		numDeleted = (delSize - deletedFileHeaderSize) / 8
-	}
+	numDeleted := uint64(delSize / 8)
 
 	f := &Forest{
 		file:                 file,
 		deletedFile:          deletedFile,
 		addIndexFile:         addIndexFile,
+		metaFile:             metaFile,
 		NumLeaves:            numLeaves,
 		forestRows:           forestRows,
 		positionMap:          make(map[miniHash]uint64, numLeaves),
 		deletedLeafPositions: make(map[uint64]struct{}, numDeleted),
 	}
 
-	// Rebuild deletedLeafPositions and recordMode from deletedFile
+	// Load metadata (recordMode)
+	if err := f.loadMetadata(); err != nil {
+		return nil, fmt.Errorf("load metadata: %w", err)
+	}
+
+	// Rebuild deletedLeafPositions from deletedFile
 	if err := f.loadDeletedPositions(); err != nil {
 		return nil, fmt.Errorf("load deleted positions: %w", err)
 	}
@@ -131,42 +136,46 @@ func NewForest(file, deletedFile, addIndexFile io.ReadWriteSeeker, forestRows ui
 	return f, nil
 }
 
-// loadDeletedPositions reads the header and all deleted leaf positions from deletedFile.
-// File format: [8-byte header: byte 0 = recordMode, bytes 1-7 reserved][uint64 positions...]
+// loadMetadata reads recordMode from metaFile (bytes 0-31, padded).
+func (f *Forest) loadMetadata() error {
+	_, err := f.metaFile.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+	var buf [32]byte
+	n, err := f.metaFile.Read(buf[:])
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if n >= 1 {
+		f.recordMode = buf[0] != 0
+	}
+	return nil
+}
+
+// loadDeletedPositions reads all deleted leaf positions from deletedFile.
 func (f *Forest) loadDeletedPositions() error {
-	// Get file size first
 	size, err := f.deletedFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
 	}
 
 	if size == 0 {
-		// Empty file, initialize header
-		return f.saveRecordMode()
+		return nil
 	}
 
-	// Seek back to start and read header
 	_, err = f.deletedFile.Seek(0, io.SeekStart)
 	if err != nil {
 		return err
 	}
 
-	// Read recordMode from byte 0
-	var mode byte
-	err = binary.Read(f.deletedFile, binary.LittleEndian, &mode)
-	if err != nil {
-		return err
-	}
-	f.recordMode = mode != 0
-
-	// Skip rest of header
-	_, err = f.deletedFile.Seek(deletedFileHeaderSize, io.SeekStart)
+	numEntries := size / 8
+	buf := make([]byte, numEntries*8)
+	_, err = io.ReadFull(f.deletedFile, buf)
 	if err != nil {
 		return err
 	}
 
-	// Read all deleted position entries
-	numEntries := (size - deletedFileHeaderSize) / 8
 	for i := int64(0); i < numEntries; i++ {
 		var pos uint64
 		err := binary.Read(f.deletedFile, binary.LittleEndian, &pos)
@@ -179,20 +188,31 @@ func (f *Forest) loadDeletedPositions() error {
 	return nil
 }
 
-// saveRecordMode writes the recordMode to deletedFile header (byte 0).
+// saveRecordMode writes the recordMode to metaFile (bytes 0-31, padded).
 func (f *Forest) saveRecordMode() error {
-	_, err := f.deletedFile.Seek(0, io.SeekStart)
+	_, err := f.metaFile.Seek(0, io.SeekStart)
 	if err != nil {
 		return err
 	}
 
-	// Write 8-byte header (recordMode in byte 0, rest reserved)
-	var header [deletedFileHeaderSize]byte
+	var buf [32]byte
 	if f.recordMode {
-		header[0] = 1
+		buf[0] = 1
 	}
-	_, err = f.deletedFile.Write(header[:])
+	_, err = f.metaFile.Write(buf[:])
 	return err
+}
+
+// ReadConsistencyHash reads the consistency hash from metaFile (bytes 32-63).
+// The hash is written atomically by WAL.Flush().
+func (f *Forest) ReadConsistencyHash() ([32]byte, error) {
+	var hash [32]byte
+	_, err := f.metaFile.Seek(32, io.SeekStart)
+	if err != nil {
+		return hash, err
+	}
+	_, err = io.ReadFull(f.metaFile, hash[:])
+	return hash, err
 }
 
 // recordDeletedPosition appends a deleted leaf position to the deletedFile.
@@ -219,8 +239,7 @@ func (f *Forest) popDeletedPositions(n int) ([]uint64, error) {
 		return nil, err
 	}
 
-	// Account for header when calculating entries
-	totalEntries := (endOffset - deletedFileHeaderSize) / 8
+	totalEntries := endOffset / 8
 	if int64(n) > totalEntries {
 		return nil, fmt.Errorf("popDeletedPositions: requested %d but only %d recorded", n, totalEntries)
 	}
@@ -234,7 +253,7 @@ func (f *Forest) popDeletedPositions(n int) ([]uint64, error) {
 
 	// Read the positions
 	positions := make([]uint64, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		err := binary.Read(f.deletedFile, binary.LittleEndian, &positions[i])
 		if err != nil {
 			return nil, err

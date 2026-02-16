@@ -1,0 +1,582 @@
+package utreexo
+
+import (
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"reflect"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// crashAfterCommit simulates a crash that occurs after the journal has
+// been fully written and synced, but before entries are applied to the
+// underlying files. A subsequent NewWAL on the same journal + files
+// will replay the committed entries during recovery.
+//
+// The wal should not be used after calling this.
+func (w *WAL) crashAfterCommit() error {
+	entries := w.collectEntries()
+	if len(entries) == 0 {
+		return fmt.Errorf("wal crash: nothing to commit")
+	}
+
+	entriesBuf := serializeEntries(entries)
+	totalLen := uint64(len(entriesBuf))
+
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], totalLen)
+
+	// Use a zero bestHash for testing.
+	var bestHash [journalHashSize]byte
+
+	// CRC over header + bestHash + entries.
+	crc := crc32.NewIEEE()
+	crc.Write(header[:])
+	crc.Write(bestHash[:])
+	crc.Write(entriesBuf)
+	var checksumBuf [journalChecksumSize]byte
+	binary.LittleEndian.PutUint32(checksumBuf[:], crc.Sum32())
+
+	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(header[:]); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(bestHash[:]); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(entriesBuf); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(checksumBuf[:]); err != nil {
+		return err
+	}
+
+	// Journal is committed but entries are NOT applied. Power off.
+	return nil
+}
+
+// crashBeforeCommit simulates a crash that occurs while the journal is
+// being written, before the checksum is flushed. The journal will be
+// incomplete, so a subsequent NewWAL will discard it and the underlying
+// files will remain at their previous consistent state.
+//
+// The wal should not be used after calling this.
+func (w *WAL) crashBeforeCommit() error {
+	entries := w.collectEntries()
+	if len(entries) == 0 {
+		return fmt.Errorf("wal crash: nothing to commit")
+	}
+
+	entriesBuf := serializeEntries(entries)
+	totalLen := uint64(len(entriesBuf))
+
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], totalLen)
+
+	// Use a zero bestHash for testing.
+	var bestHash [journalHashSize]byte
+
+	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(header[:]); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(bestHash[:]); err != nil {
+		return err
+	}
+	if _, err := w.journal.Write(entriesBuf); err != nil {
+		return err
+	}
+
+	// Checksum NOT written. Power off.
+	return nil
+}
+
+// TestWALBasicFlush verifies that data only reaches underlying files after Flush.
+func TestWALBasicFlush(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// Write a hash to file 0.
+	h := testHashFromInt(1)
+	_, err = w.Cached(0).Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	_, err = w.Cached(0).Write(h[:])
+	require.NoError(t, err)
+
+	// Write 8 bytes to file 1.
+	_, err = w.Cached(1).Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	err = binary.Write(w.Cached(1), binary.LittleEndian, uint64(42))
+	require.NoError(t, err)
+
+	// Write 4 bytes to file 2.
+	_, err = w.Cached(2).Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	err = binary.Write(w.Cached(2), binary.LittleEndian, int32(7))
+	require.NoError(t, err)
+
+	// Underlying files should still be empty.
+	require.Equal(t, 0, len(files[0].data), "file 0 should be empty before Flush")
+	require.Equal(t, 0, len(files[1].data), "file 1 should be empty before Flush")
+	require.Equal(t, 0, len(files[2].data), "file 2 should be empty before Flush")
+	require.Equal(t, 0, len(files[3].data), "file 3 should be empty before Flush")
+
+	// Flush.
+	require.NoError(t, w.Flush([32]byte{}))
+
+	// Now underlying files should have data.
+	require.Equal(t, 32, len(files[0].data), "file 0 should have 32 bytes after Flush")
+	require.Equal(t, 8, len(files[1].data), "file 1 should have 8 bytes after Flush")
+	require.Equal(t, 4, len(files[2].data), "file 2 should have 4 bytes after Flush")
+	require.Equal(t, 64, len(files[3].data), "file 3 should have 64 bytes after Flush (consistency hash at offset 32)")
+
+	// Verify the data is correct.
+	var gotHash Hash
+	copy(gotHash[:], files[0].data)
+	require.Equal(t, h, gotHash)
+
+	gotVal := binary.LittleEndian.Uint64(files[1].data)
+	require.Equal(t, uint64(42), gotVal)
+
+	gotIdx := int32(binary.LittleEndian.Uint32(files[2].data))
+	require.Equal(t, int32(7), gotIdx)
+
+	// Caches should be empty after flush.
+	require.Equal(t, 0, w.Cached(0).cache.count())
+	require.Equal(t, 0, w.Cached(1).cache.count())
+	require.Equal(t, 0, w.Cached(2).cache.count())
+	require.Equal(t, 0, w.Cached(3).cache.count())
+
+	// Journal should be cleared (totalLen = 0).
+	_, err = journal.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	var totalLen uint64
+	err = binary.Read(journal, binary.LittleEndian, &totalLen)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), totalLen)
+}
+
+// TestWALRecovery simulates a crash after the journal is committed but
+// before entries are applied to the underlying files. Recovery should
+// replay the journal.
+func TestWALRecovery(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	// Build a valid journal manually (simulating a committed Flush
+	// that crashed before applying to underlying files).
+	h := testHashFromInt(99)
+	entries := []journalEntry{
+		{fileIdx: 0, offset: 0, data: h[:]},
+		{fileIdx: 1, offset: 0, data: []byte{1, 0, 0, 0, 0, 0, 0, 0}}, // deleted position
+		{fileIdx: 2, offset: 0, data: []byte{5, 0, 0, 0}},             // addIndex=5
+		{fileIdx: 3, offset: 32, data: make([]byte, 32)},              // consistency hash
+	}
+	entriesBuf := serializeEntries(entries)
+	totalLen := uint64(len(entriesBuf))
+
+	// Write valid journal with new format: header + bestHash + entries + checksum.
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], totalLen)
+
+	var bestHash [journalHashSize]byte // zero hash for testing
+
+	crc := crc32.NewIEEE()
+	crc.Write(header[:])
+	crc.Write(bestHash[:])
+	crc.Write(entriesBuf)
+	var checksumBuf [journalChecksumSize]byte
+	binary.LittleEndian.PutUint32(checksumBuf[:], crc.Sum32())
+
+	_, err := journal.Write(header[:])
+	require.NoError(t, err)
+	_, err = journal.Write(bestHash[:])
+	require.NoError(t, err)
+	_, err = journal.Write(entriesBuf)
+	require.NoError(t, err)
+	_, err = journal.Write(checksumBuf[:])
+	require.NoError(t, err)
+
+	// Underlying files are empty (simulating crash before apply).
+	require.Equal(t, 0, len(files[0].data))
+	require.Equal(t, 0, len(files[1].data))
+	require.Equal(t, 0, len(files[2].data))
+	require.Equal(t, 0, len(files[3].data))
+
+	// Create WAL — recovery should replay the journal.
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// Underlying files should now have the recovered data.
+	require.Equal(t, 32, len(files[0].data), "file 0 should be recovered")
+	require.Equal(t, 8, len(files[1].data), "file 1 should be recovered")
+	require.Equal(t, 4, len(files[2].data), "file 2 should be recovered")
+	require.Equal(t, 64, len(files[3].data), "file 3 should be recovered")
+
+	var gotHash Hash
+	copy(gotHash[:], files[0].data)
+	require.Equal(t, h, gotHash)
+
+	// Journal should be cleared after recovery.
+	_, err = journal.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	var recoveredLen uint64
+	err = binary.Read(journal, binary.LittleEndian, &recoveredLen)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), recoveredLen)
+
+	// cachedRWS should reflect the recovered underlying state.
+	require.Equal(t, int64(32), w.Cached(0).baseSize)
+	require.Equal(t, int64(8), w.Cached(1).baseSize)
+	require.Equal(t, int64(4), w.Cached(2).baseSize)
+	require.Equal(t, int64(64), w.Cached(3).baseSize)
+}
+
+// TestWALIncompleteJournal simulates a crash during journal write (before
+// the checksum is fully written). Recovery should discard the incomplete
+// journal and leave underlying files unchanged.
+func TestWALIncompleteJournal(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	// Pre-populate underlying files with known data.
+	origHash := testHashFromInt(1)
+	_, err := files[0].Write(origHash[:])
+	require.NoError(t, err)
+
+	// Write a journal with valid header + entries but NO checksum
+	// (simulating crash mid-write).
+	badHash := testHashFromInt(999)
+	entries := []journalEntry{
+		{fileIdx: 0, offset: 0, data: badHash[:]},
+	}
+	entriesBuf := serializeEntries(entries)
+	totalLen := uint64(len(entriesBuf))
+
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], totalLen)
+
+	_, err = journal.Write(header[:])
+	require.NoError(t, err)
+	_, err = journal.Write(entriesBuf)
+	require.NoError(t, err)
+	// Intentionally omit checksum.
+
+	// Create WAL — should discard incomplete journal.
+	_, err = NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// Underlying file should still have the original data.
+	var gotHash Hash
+	copy(gotHash[:], files[0].data[:32])
+	require.Equal(t, origHash, gotHash)
+}
+
+// TestWALCorruptChecksum verifies that a journal with a bad checksum
+// is discarded during recovery.
+func TestWALCorruptChecksum(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	origHash := testHashFromInt(1)
+	_, err := files[0].Write(origHash[:])
+	require.NoError(t, err)
+
+	// Write complete journal with WRONG checksum.
+	badHash := testHashFromInt(999)
+	entries := []journalEntry{
+		{fileIdx: 0, offset: 0, data: badHash[:]},
+	}
+	entriesBuf := serializeEntries(entries)
+	totalLen := uint64(len(entriesBuf))
+
+	var header [journalHeaderSize]byte
+	binary.LittleEndian.PutUint64(header[:], totalLen)
+
+	_, err = journal.Write(header[:])
+	require.NoError(t, err)
+	_, err = journal.Write(entriesBuf)
+	require.NoError(t, err)
+
+	// Write a bad checksum.
+	var badChecksum [journalChecksumSize]byte
+	binary.LittleEndian.PutUint32(badChecksum[:], 0xDEADBEEF)
+	_, err = journal.Write(badChecksum[:])
+	require.NoError(t, err)
+
+	// Create WAL — should discard corrupt journal.
+	_, err = NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// Underlying file should still have the original data.
+	var gotHash Hash
+	copy(gotHash[:], files[0].data[:32])
+	require.Equal(t, origHash, gotHash)
+}
+
+// TestWALDiscard verifies that Discard drops pending writes.
+func TestWALDiscard(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// Write data.
+	h := testHashFromInt(1)
+	_, err = w.Cached(0).Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	_, err = w.Cached(0).Write(h[:])
+	require.NoError(t, err)
+
+	// Discard.
+	w.Discard()
+
+	// Underlying should be empty.
+	require.Equal(t, 0, len(files[0].data))
+
+	// Caches should be empty.
+	require.Equal(t, 0, w.Cached(0).cache.count())
+
+	// Flush after discard still writes consistency hash to metaFile.
+	require.NoError(t, w.Flush([32]byte{}))
+	require.Equal(t, 0, len(files[0].data))
+	require.Equal(t, 64, len(files[3].data), "metaFile should have consistency hash")
+}
+
+// TestWALMultipleFlushes verifies two successive flushes accumulate data.
+func TestWALMultipleFlushes(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	// First flush: write hash at offset 0.
+	h1 := testHashFromInt(1)
+	_, err = w.Cached(0).Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	_, err = w.Cached(0).Write(h1[:])
+	require.NoError(t, err)
+	require.NoError(t, w.Flush([32]byte{}))
+
+	require.Equal(t, 32, len(files[0].data))
+
+	// Second flush: write hash at offset 32.
+	h2 := testHashFromInt(2)
+	_, err = w.Cached(0).Seek(32, io.SeekStart)
+	require.NoError(t, err)
+	_, err = w.Cached(0).Write(h2[:])
+	require.NoError(t, err)
+	require.NoError(t, w.Flush([32]byte{}))
+
+	require.Equal(t, 64, len(files[0].data))
+
+	// Verify both hashes.
+	var got Hash
+	copy(got[:], files[0].data[0:32])
+	require.Equal(t, h1, got)
+	copy(got[:], files[0].data[32:64])
+	require.Equal(t, h2, got)
+
+	// baseSize should reflect the accumulated writes.
+	require.Equal(t, int64(64), w.Cached(0).baseSize)
+}
+
+// TestWALEmptyFlush verifies that Flush with no pending cache writes
+// still writes the consistency hash to metaFile.
+func TestWALEmptyFlush(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32}, // metaFile
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Flush([32]byte{}))
+	require.Equal(t, 0, len(files[0].data))
+	require.Equal(t, 64, len(files[3].data), "metaFile should have consistency hash")
+}
+
+// TestWALForestIntegration tests Forest backed by WAL over multiple blocks,
+// comparing roots with a reference Pollard.
+func TestWALForestIntegration(t *testing.T) {
+	journal := newMemFile()
+	mainFile := newMemFile()
+	delFile := newMemFile()
+	addIdxFile := newMemFile()
+	metaFile := newMemFile()
+
+	w, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	forest, err := NewForest(w.Cached(0), w.Cached(1), w.Cached(2), w.Cached(3), 10)
+	require.NoError(t, err)
+
+	pollard := NewAccumulator()
+
+	// Run 20 blocks through simChain.
+	sc := newSimChainWithSeed(0x07, 0x07)
+
+	for b := 0; b <= 20; b++ {
+		adds, _, delHashes := sc.NextBlock(3)
+
+		proof, err := pollard.Prove(delHashes)
+		require.NoError(t, err)
+
+		forestProof, err := forest.Prove(delHashes)
+		require.NoError(t, err)
+
+		err = forest.Modify(adds, delHashes, forestProof)
+		require.NoError(t, err)
+
+		err = pollard.Modify(adds, delHashes, proof)
+		require.NoError(t, err)
+
+		forestRoots := forest.GetRoots()
+		pollardRoots := pollard.GetRoots()
+		require.True(t, reflect.DeepEqual(forestRoots, pollardRoots),
+			"block %d: roots differ", b)
+	}
+
+	// Snapshot underlying file contents before flush.
+	// (memFile.Read auto-extends with zeros on cache misses, so the
+	// underlying may have grown, but it should only contain zeros
+	// at positions that were never written through the WAL.)
+	preFlushMain := make([]byte, len(mainFile.data))
+	copy(preFlushMain, mainFile.data)
+
+	// Flush through WAL.
+	require.NoError(t, w.Flush([32]byte{}))
+
+	// Restart forest from flushed underlying files and verify roots match.
+	forest2, err := NewForest(mainFile, delFile, addIdxFile, metaFile, 10)
+	require.NoError(t, err)
+	require.Equal(t, forest.GetRoots(), forest2.GetRoots(),
+		"roots should match after restart from WAL-flushed data")
+	_ = preFlushMain // silence unused variable warning
+}
+
+// TestWALForestRecovery simulates a crash after WAL journal commit but
+// before applying to underlying files. On recovery, the forest should
+// be in the correct state.
+func TestWALForestRecovery(t *testing.T) {
+	journal := newMemFile()
+	mainFile := newMemFile()
+	delFile := newMemFile()
+	addIdxFile := newMemFile()
+	metaFile := newMemFile()
+
+	w, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	forest, err := NewForest(w.Cached(0), w.Cached(1), w.Cached(2), w.Cached(3), 10)
+	require.NoError(t, err)
+
+	pollard := NewAccumulator()
+
+	// Add 8 leaves.
+	leaves := make([]Leaf, 8)
+	for i := range leaves {
+		leaves[i] = Leaf{Hash: testHashFromInt(i + 1)}
+	}
+	err = forest.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+	err = pollard.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+
+	// Flush block 1 — this completes normally.
+	require.NoError(t, w.Flush([32]byte{}))
+
+	// Now delete 2 leaves (block 2).
+	delHashes := []Hash{leaves[0].Hash, leaves[3].Hash}
+	forestProof, err := forest.Prove(delHashes)
+	require.NoError(t, err)
+	err = forest.Modify(nil, delHashes, forestProof)
+	require.NoError(t, err)
+
+	pollardProof, err := pollard.Prove(delHashes)
+	require.NoError(t, err)
+	err = pollard.Modify(nil, delHashes, pollardProof)
+	require.NoError(t, err)
+
+	// Save the expected roots for block 2.
+	expectedRoots := forest.GetRoots()
+
+	// Simulate crash: journal committed but not applied.
+	require.NoError(t, w.crashAfterCommit())
+
+	// Underlying files still only have block 1 data (crash before apply).
+	// Now "restart": create a new WAL which should recover from journal.
+	w2, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	// Build forest from recovered underlying files.
+	forest2, err := NewForest(
+		w2.Cached(0), w2.Cached(1), w2.Cached(2), w2.Cached(3), 10,
+	)
+	require.NoError(t, err)
+
+	// Roots should match the expected post-block-2 state.
+	require.Equal(t, expectedRoots, forest2.GetRoots(),
+		"roots should match after WAL recovery")
+}

@@ -124,7 +124,7 @@ func compareRoots(t *testing.T, forest *Forest, pollard Pollard, context string)
 func TestForestString(t *testing.T) {
 	file := newMemFile()
 	// Use small forestRows for visualization
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 3)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), newMemFile(), 3)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestForestString(t *testing.T) {
 // TestForestSanityCheck tests that sanityCheck catches inconsistencies.
 func TestForestSanityCheck(t *testing.T) {
 	file := newMemFile()
-	forest, err := NewForest(file, newMemFile(), newMemFile(), 10)
+	forest, err := NewForest(file, newMemFile(), newMemFile(), newMemFile(), 10)
 	if err != nil {
 		t.Fatalf("NewForest: %v", err)
 	}
@@ -242,9 +242,8 @@ func (f *Forest) sanityCheck() error {
 	if err != nil {
 		return fmt.Errorf("deletedFile seek: %w", err)
 	}
-	// Account for 8-byte header (recordMode + reserved)
-	fileEntries := (fileSize - deletedFileHeaderSize) / 8
 	mapEntries := int64(len(f.deletedLeafPositions))
+	fileEntries := fileSize / 8
 	if fileEntries != mapEntries {
 		return fmt.Errorf("deletedLeafPositions mismatch: file has %d entries, map has %d",
 			fileEntries, mapEntries)
@@ -392,7 +391,7 @@ func FuzzForestChain(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 16)
+		forest, err := NewForest(memFile, delFile, newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,13 +475,13 @@ func FuzzForestRecord(f *testing.F) {
 		sc := newSimChainWithSeed(duration, seed)
 
 		// Forest using normal Modify
-		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
+		modifyForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Forest using Record + HashAll
-		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), 16)
+		recordForest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -586,7 +585,7 @@ func FuzzTreeBuilding(f *testing.F) {
 
 		memFile := newMemFile()
 		delFile := newMemFile()
-		forest, err := NewForest(memFile, delFile, newMemFile(), 17)
+		forest, err := NewForest(memFile, delFile, newMemFile(), newMemFile(), 17)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -619,6 +618,7 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	underlyingFile := newMemFile()
 	underlyingDelFile := newMemFile()
 	underlyingAddIdxFile := newMemFile()
+	underlyingMetaFile := newMemFile()
 
 	// Wrap each with cachedRWS so all writes are buffered.
 	cachedFile, err := newCachedRWS(underlyingFile, 32, 0)
@@ -627,9 +627,11 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	require.NoError(t, err)
 	cachedAddIdxFile, err := newCachedRWS(underlyingAddIdxFile, 4, 0)
 	require.NoError(t, err)
+	cachedMetaFile, err := newCachedRWS(underlyingMetaFile, 32, 0)
+	require.NoError(t, err)
 
 	// Create forest backed by the cached files.
-	forest, err := NewForest(cachedFile, cachedDelFile, cachedAddIdxFile, 10)
+	forest, err := NewForest(cachedFile, cachedDelFile, cachedAddIdxFile, cachedMetaFile, 10)
 	require.NoError(t, err)
 
 	// Reference pollard for correctness comparison.
@@ -683,9 +685,164 @@ func TestForestCachedRWSNoFlush(t *testing.T) {
 	// Restart a new forest from the flushed underlying files
 	// and verify the roots still match.
 	forest2, err := NewForest(
-		underlyingFile, underlyingDelFile, underlyingAddIdxFile, 10,
+		underlyingFile, underlyingDelFile, underlyingAddIdxFile, underlyingMetaFile, 10,
 	)
 	require.NoError(t, err)
 	require.Equal(t, forest.GetRoots(), forest2.GetRoots(),
 		"roots should match after restart from flushed data")
+}
+
+// TestForestCrashRecovery runs 400 blocks through simChain, flushes
+// successfully at block 200, then continues through block 400 without
+// flushing. A crash with a fully committed journal (valid checksum)
+// is simulated. On recovery the WAL replays the journal and the forest
+// should be at the block-400 state.
+func TestForestCrashRecovery(t *testing.T) {
+	journal := newMemFile()
+	mainFile := newMemFile()
+	delFile := newMemFile()
+	addIdxFile := newMemFile()
+	metaFile := newMemFile()
+
+	w, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	forest, err := NewForest(w.Cached(0), w.Cached(1), w.Cached(2), w.Cached(3), 16)
+	require.NoError(t, err)
+
+	pollard := NewAccumulator()
+	sc := newSimChainWithSeed(0x07, 0x07)
+
+	var block200Roots []Hash
+
+	for b := 1; b <= 400; b++ {
+		adds, _, delHashes := sc.NextBlock(5)
+
+		proof, err := pollard.Prove(delHashes)
+		require.NoError(t, err)
+
+		err = forest.Modify(adds, delHashes, proof)
+		require.NoError(t, err)
+
+		err = pollard.Modify(adds, delHashes, proof)
+		require.NoError(t, err)
+
+		compareRoots(t, forest, pollard, fmt.Sprintf("block %d", b))
+
+		if b == 200 {
+			require.NoError(t, w.Flush([32]byte{}))
+			block200Roots = forest.GetRoots()
+		}
+	}
+
+	block400Roots := forest.GetRoots()
+
+	// ---- Simulate crash: journal committed but not applied ----
+	require.NoError(t, w.crashAfterCommit())
+
+	// Underlying files still only have block-200 data.
+	preRecoveryForest, err := NewForest(
+		mainFile, delFile, addIdxFile, metaFile, 16,
+	)
+	require.NoError(t, err)
+	require.Equal(t, block200Roots, preRecoveryForest.GetRoots(),
+		"underlying files should still reflect block 200")
+
+	// ---- "Restart": new WAL recovers from journal ----
+	w2, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	recoveredForest, err := NewForest(
+		w2.Cached(0), w2.Cached(1), w2.Cached(2), w2.Cached(3), 16,
+	)
+	require.NoError(t, err)
+	require.Equal(t, block400Roots, recoveredForest.GetRoots(),
+		"recovered forest should reflect block 400 state")
+
+	// Journal should be cleared after recovery.
+	journal.Seek(0, io.SeekStart)
+	var recoveredLen uint64
+	err = binary.Read(journal, binary.LittleEndian, &recoveredLen)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), recoveredLen, "journal should be cleared")
+}
+
+// TestForestCrashIncompleteJournal runs 400 blocks through simChain,
+// flushes successfully at block 200, then continues through block 400
+// without flushing. A crash with an incomplete journal (no checksum)
+// is simulated. On recovery the forest should be back at block 200.
+func TestForestCrashIncompleteJournal(t *testing.T) {
+	journal := newMemFile()
+	mainFile := newMemFile()
+	delFile := newMemFile()
+	addIdxFile := newMemFile()
+	metaFile := newMemFile()
+
+	w, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	forest, err := NewForest(w.Cached(0), w.Cached(1), w.Cached(2), w.Cached(3), 16)
+	require.NoError(t, err)
+
+	pollard := NewAccumulator()
+	sc := newSimChainWithSeed(0x07, 0x07)
+
+	var savedRoots []Hash
+
+	for b := 1; b <= 400; b++ {
+		adds, _, delHashes := sc.NextBlock(5)
+
+		proof, err := pollard.Prove(delHashes)
+		require.NoError(t, err)
+
+		err = forest.Modify(adds, delHashes, proof)
+		require.NoError(t, err)
+
+		err = pollard.Modify(adds, delHashes, proof)
+		require.NoError(t, err)
+
+		compareRoots(t, forest, pollard, fmt.Sprintf("block %d", b))
+
+		if b == 200 {
+			// Flush at block 200.
+			require.NoError(t, w.Flush([32]byte{}))
+			savedRoots = forest.GetRoots()
+		}
+	}
+
+	// Blocks 200-399 are only in the cache. Simulate crash with
+	// an incomplete journal write (no checksum).
+	require.NoError(t, w.crashBeforeCommit())
+
+	// "Restart": new WAL should discard the incomplete journal.
+	w2, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	// Forest should be back at the block-200 state.
+	recoveredForest, err := NewForest(
+		w2.Cached(0), w2.Cached(1), w2.Cached(2), w2.Cached(3), 16,
+	)
+	require.NoError(t, err)
+	require.Equal(t, savedRoots, recoveredForest.GetRoots(),
+		"forest should be at block 200 state after incomplete journal")
 }
