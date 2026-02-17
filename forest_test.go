@@ -846,3 +846,48 @@ func TestForestCrashIncompleteJournal(t *testing.T) {
 	require.Equal(t, savedRoots, recoveredForest.GetRoots(),
 		"forest should be at block 200 state after incomplete journal")
 }
+
+// TestForestVerifyDeletedLeaf tests that Verify correctly rejects leaves
+// that have already been deleted. This specifically tests leaves with
+// addIndex > 0 to catch bugs where packed values are used instead of
+// unpacked positions.
+func TestForestVerifyDeletedLeaf(t *testing.T) {
+	forest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 8)
+	require.NoError(t, err)
+
+	// Add 4 leaves in one batch - they'll have addIndex 0, 1, 2, 3
+	hashes := make([]Hash, 4)
+	leaves := make([]Leaf, 4)
+	for i := range 4 {
+		hashes[i] = testHashFromInt(i)
+		leaves[i] = Leaf{Hash: hashes[i]}
+	}
+
+	err = forest.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+
+	// Verify all leaves exist
+	for _, h := range hashes {
+		err = forest.Verify([]Hash{h}, Proof{}, false)
+		require.NoError(t, err, "leaf should exist before deletion")
+	}
+
+	// Delete leaf at index 2 (addIndex=2, which would cause bug if packed value used)
+	delHash := hashes[2]
+	err = forest.Modify(nil, []Hash{delHash}, Proof{})
+	require.NoError(t, err)
+
+	// Verify the deleted leaf should now fail
+	err = forest.Verify([]Hash{delHash}, Proof{}, false)
+	require.Error(t, err, "Verify should reject deleted leaf")
+	require.Contains(t, err.Error(), "already been deleted")
+
+	// Other leaves should still verify
+	for i, h := range hashes {
+		if i == 2 {
+			continue // skip deleted
+		}
+		err = forest.Verify([]Hash{h}, Proof{}, false)
+		require.NoError(t, err, "non-deleted leaf should still verify")
+	}
+}
