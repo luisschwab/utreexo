@@ -1363,12 +1363,12 @@ func (f *Forest) Verify(delHashes []Hash, _ Proof, _ bool) error {
 	defer f.mu.RUnlock()
 
 	for _, delHash := range delHashes {
-		pos, found := f.positionMap[delHash.mini()]
+		packed, found := f.positionMap[delHash.mini()]
 		if !found {
 			return fmt.Errorf("hash %v doesn't exist in the forest", delHash)
 		}
 
-		_, deleted := f.deletedLeafPositions[pos]
+		_, deleted := f.deletedLeafPositions[unpackPos(packed)]
 		if deleted {
 			return fmt.Errorf("hash %v has already been deleted in the forest", delHash)
 		}

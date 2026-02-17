@@ -173,7 +173,7 @@ func TestForestSanityCheck(t *testing.T) {
 	// Test 1: Corrupt positionMap by adding wrong entry
 	// This should be caught by sanityCheck (either positionMap or parent verification)
 	wrongHash := testHashFromInt(999)
-	forest.positionMap[wrongHash.mini()] = 0 // points to position 0, but hash there is hashes[0]
+	forest.positionMap[wrongHash.mini()] = packPosIndex(0, 0) // points to position 0, but hash there is hashes[0]
 	err = forest.sanityCheck()
 	if err == nil {
 		t.Error("sanityCheck should fail with corrupted positionMap")
@@ -184,14 +184,14 @@ func TestForestSanityCheck(t *testing.T) {
 	// Test 2: Corrupt positionMap by pointing to wrong position
 	// This should be caught by sanityCheck (either positionMap or parent verification)
 	// Use position 1 instead of 99 since sanityCheck skips positions >= NumLeaves
-	originalPos := forest.positionMap[hashes[0].mini()]
-	forest.positionMap[hashes[0].mini()] = 1 // wrong position (has different hash)
+	originalPacked := forest.positionMap[hashes[0].mini()]
+	forest.positionMap[hashes[0].mini()] = packPosIndex(1, 0) // wrong position (has different hash)
 	err = forest.sanityCheck()
 	if err == nil {
 		t.Error("sanityCheck should fail with wrong position in positionMap")
 	}
 	// Clean up
-	forest.positionMap[hashes[0].mini()] = originalPos
+	forest.positionMap[hashes[0].mini()] = originalPacked
 
 	// Test 3: Corrupt file by writing wrong hash to leaf position
 	// This should be caught by sanityCheck (either positionMap or parent verification)
@@ -266,7 +266,9 @@ func (f *Forest) sanityCheck() error {
 	// Track which parent positions we've already verified
 	verified := make(map[uint64]bool)
 
-	for mini, pos := range f.positionMap {
+	for mini, packed := range f.positionMap {
+		pos := unpackPos(packed)
+
 		// Skip positions >= NumLeaves (undone additions)
 		if pos >= f.NumLeaves {
 			continue
@@ -346,7 +348,9 @@ func (f *Forest) nodeMapToString() string {
 func (f *Forest) positionMapToString() string {
 	var sb strings.Builder
 	idx := 0
-	for h, pos := range f.positionMap {
+	for h, packed := range f.positionMap {
+		pos := unpackPos(packed)
+
 		// Skip positions >= NumLeaves (undone additions)
 		if pos >= f.NumLeaves {
 			continue
