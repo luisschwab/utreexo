@@ -124,10 +124,10 @@ func (cms *cacheMap32) deleteAbove(size int64) {
 }
 
 func (cms *cacheMap32) clear() {
-	for i := range cms.maps {
-		cms.maps[i] = make(map[int64][32]byte, cms.maxEntries[i])
+	for _, m := range cms.maps {
+		clear(m)
 	}
-	cms.overflow = make(map[int64][32]byte)
+	clear(cms.overflow)
 }
 
 func (cms *cacheMap32) forEach(fn func(offset int64, data []byte)) {
@@ -240,10 +240,10 @@ func (cms *cacheMap8) deleteAbove(size int64) {
 }
 
 func (cms *cacheMap8) clear() {
-	for i := range cms.maps {
-		cms.maps[i] = make(map[int64][8]byte, cms.maxEntries[i])
+	for _, m := range cms.maps {
+		clear(m)
 	}
-	cms.overflow = make(map[int64][8]byte)
+	clear(cms.overflow)
 }
 
 func (cms *cacheMap8) forEach(fn func(offset int64, data []byte)) {
@@ -356,10 +356,10 @@ func (cms *cacheMap4) deleteAbove(size int64) {
 }
 
 func (cms *cacheMap4) clear() {
-	for i := range cms.maps {
-		cms.maps[i] = make(map[int64][4]byte, cms.maxEntries[i])
+	for _, m := range cms.maps {
+		clear(m)
 	}
-	cms.overflow = make(map[int64][4]byte)
+	clear(cms.overflow)
 }
 
 func (cms *cacheMap4) forEach(fn func(offset int64, data []byte)) {
