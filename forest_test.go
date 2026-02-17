@@ -173,7 +173,7 @@ func TestForestSanityCheck(t *testing.T) {
 	// Test 1: Corrupt positionMap by adding wrong entry
 	// This should be caught by sanityCheck (either positionMap or parent verification)
 	wrongHash := testHashFromInt(999)
-	forest.positionMap[wrongHash.mini()] = 0 // points to position 0, but hash there is hashes[0]
+	forest.positionMap[wrongHash.mini()] = packPosIndex(0, 0) // points to position 0, but hash there is hashes[0]
 	err = forest.sanityCheck()
 	if err == nil {
 		t.Error("sanityCheck should fail with corrupted positionMap")
@@ -184,14 +184,14 @@ func TestForestSanityCheck(t *testing.T) {
 	// Test 2: Corrupt positionMap by pointing to wrong position
 	// This should be caught by sanityCheck (either positionMap or parent verification)
 	// Use position 1 instead of 99 since sanityCheck skips positions >= NumLeaves
-	originalPos := forest.positionMap[hashes[0].mini()]
-	forest.positionMap[hashes[0].mini()] = 1 // wrong position (has different hash)
+	originalPacked := forest.positionMap[hashes[0].mini()]
+	forest.positionMap[hashes[0].mini()] = packPosIndex(1, 0) // wrong position (has different hash)
 	err = forest.sanityCheck()
 	if err == nil {
 		t.Error("sanityCheck should fail with wrong position in positionMap")
 	}
 	// Clean up
-	forest.positionMap[hashes[0].mini()] = originalPos
+	forest.positionMap[hashes[0].mini()] = originalPacked
 
 	// Test 3: Corrupt file by writing wrong hash to leaf position
 	// This should be caught by sanityCheck (either positionMap or parent verification)
@@ -266,7 +266,9 @@ func (f *Forest) sanityCheck() error {
 	// Track which parent positions we've already verified
 	verified := make(map[uint64]bool)
 
-	for mini, pos := range f.positionMap {
+	for mini, packed := range f.positionMap {
+		pos := unpackPos(packed)
+
 		// Skip positions >= NumLeaves (undone additions)
 		if pos >= f.NumLeaves {
 			continue
@@ -346,7 +348,9 @@ func (f *Forest) nodeMapToString() string {
 func (f *Forest) positionMapToString() string {
 	var sb strings.Builder
 	idx := 0
-	for h, pos := range f.positionMap {
+	for h, packed := range f.positionMap {
+		pos := unpackPos(packed)
+
 		// Skip positions >= NumLeaves (undone additions)
 		if pos >= f.NumLeaves {
 			continue
@@ -845,4 +849,49 @@ func TestForestCrashIncompleteJournal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, savedRoots, recoveredForest.GetRoots(),
 		"forest should be at block 200 state after incomplete journal")
+}
+
+// TestForestVerifyDeletedLeaf tests that Verify correctly rejects leaves
+// that have already been deleted. This specifically tests leaves with
+// addIndex > 0 to catch bugs where packed values are used instead of
+// unpacked positions.
+func TestForestVerifyDeletedLeaf(t *testing.T) {
+	forest, err := NewForest(newMemFile(), newMemFile(), newMemFile(), newMemFile(), 8)
+	require.NoError(t, err)
+
+	// Add 4 leaves in one batch - they'll have addIndex 0, 1, 2, 3
+	hashes := make([]Hash, 4)
+	leaves := make([]Leaf, 4)
+	for i := range 4 {
+		hashes[i] = testHashFromInt(i)
+		leaves[i] = Leaf{Hash: hashes[i]}
+	}
+
+	err = forest.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+
+	// Verify all leaves exist
+	for _, h := range hashes {
+		err = forest.Verify([]Hash{h}, Proof{}, false)
+		require.NoError(t, err, "leaf should exist before deletion")
+	}
+
+	// Delete leaf at index 2 (addIndex=2, which would cause bug if packed value used)
+	delHash := hashes[2]
+	err = forest.Modify(nil, []Hash{delHash}, Proof{})
+	require.NoError(t, err)
+
+	// Verify the deleted leaf should now fail
+	err = forest.Verify([]Hash{delHash}, Proof{}, false)
+	require.Error(t, err, "Verify should reject deleted leaf")
+	require.Contains(t, err.Error(), "already been deleted")
+
+	// Other leaves should still verify
+	for i, h := range hashes {
+		if i == 2 {
+			continue // skip deleted
+		}
+		err = forest.Verify([]Hash{h}, Proof{}, false)
+		require.NoError(t, err, "non-deleted leaf should still verify")
+	}
 }
