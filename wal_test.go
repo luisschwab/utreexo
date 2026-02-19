@@ -11,6 +11,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// serializeEntries encodes journal entries into a byte slice (test helper).
+func serializeEntries(entries []journalEntry) []byte {
+	size := 0
+	for _, e := range entries {
+		size += entryHeaderSize + len(e.data)
+	}
+
+	buf := make([]byte, 0, size)
+	for _, e := range entries {
+		buf = append(buf, e.fileIdx)
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(e.offset))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.data)))
+		buf = append(buf, e.data...)
+	}
+	return buf
+}
+
 // crashAfterCommit simulates a crash that occurs after the journal has
 // been fully written and synced, but before entries are applied to the
 // underlying files. A subsequent NewWAL on the same journal + files
@@ -18,19 +35,17 @@ import (
 //
 // The wal should not be used after calling this.
 func (w *WAL) crashAfterCommit() error {
-	entries := w.collectEntries()
-	if len(entries) == 0 {
+	// Use a zero bestHash for testing.
+	var bestHash [journalHashSize]byte
+
+	entriesBuf := w.serializeEntries(bestHash)
+	if len(entriesBuf) == 0 {
 		return fmt.Errorf("wal crash: nothing to commit")
 	}
-
-	entriesBuf := serializeEntries(entries)
 	totalLen := uint64(len(entriesBuf))
 
 	var header [journalHeaderSize]byte
 	binary.LittleEndian.PutUint64(header[:], totalLen)
-
-	// Use a zero bestHash for testing.
-	var bestHash [journalHashSize]byte
 
 	// CRC over header + bestHash + entries.
 	crc := crc32.NewIEEE()
@@ -67,19 +82,17 @@ func (w *WAL) crashAfterCommit() error {
 //
 // The wal should not be used after calling this.
 func (w *WAL) crashBeforeCommit() error {
-	entries := w.collectEntries()
-	if len(entries) == 0 {
+	// Use a zero bestHash for testing.
+	var bestHash [journalHashSize]byte
+
+	entriesBuf := w.serializeEntries(bestHash)
+	if len(entriesBuf) == 0 {
 		return fmt.Errorf("wal crash: nothing to commit")
 	}
-
-	entriesBuf := serializeEntries(entries)
 	totalLen := uint64(len(entriesBuf))
 
 	var header [journalHeaderSize]byte
 	binary.LittleEndian.PutUint64(header[:], totalLen)
-
-	// Use a zero bestHash for testing.
-	var bestHash [journalHashSize]byte
 
 	if _, err := w.journal.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -342,6 +355,106 @@ func TestWALCorruptChecksum(t *testing.T) {
 	var gotHash Hash
 	copy(gotHash[:], files[0].data[:32])
 	require.Equal(t, origHash, gotHash)
+}
+
+// TestWALRequiresFourFiles ensures NewWAL only accepts exactly 4 files.
+func TestWALRequiresFourFiles(t *testing.T) {
+	tests := []struct {
+		name       string
+		fileCount  int
+		expectFail bool
+	}{
+		{name: "zero", fileCount: 0, expectFail: true},
+		{name: "one", fileCount: 1, expectFail: true},
+		{name: "two", fileCount: 2, expectFail: true},
+		{name: "three", fileCount: 3, expectFail: true},
+		{name: "four", fileCount: 4, expectFail: false},
+		{name: "five", fileCount: 5, expectFail: true},
+		{name: "six", fileCount: 6, expectFail: true},
+	}
+
+	entrySizes := []int{32, 8, 4, 32, 32, 32}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := newMemFile()
+			files := make([]WALFile, tc.fileCount)
+			for i := 0; i < tc.fileCount; i++ {
+				files[i] = WALFile{File: newMemFile(), EntrySize: entrySizes[i%len(entrySizes)]}
+			}
+
+			_, err := NewWAL(journal, files...)
+			if tc.expectFail {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "exactly 4 files")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestWALOversizeTotalLen ensures recovery clears journals with oversized totalLen values.
+func TestWALOversizeTotalLen(t *testing.T) {
+	tests := []struct {
+		name     string
+		totalLen uint64
+	}{
+		{name: "exceeds-file-size", totalLen: 1000},
+		{name: "max-int64-plus-one", totalLen: ^uint64(0)>>1 + 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := newMemFile()
+			files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+			// Pre-populate files to detect unintended recovery writes.
+			origHash := testHashFromInt(7)
+			_, err := files[0].Write(origHash[:])
+			require.NoError(t, err)
+			_, err = files[1].Write([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+			require.NoError(t, err)
+			_, err = files[2].Write([]byte{9, 10, 11, 12})
+			require.NoError(t, err)
+			_, err = files[3].Write(make([]byte, 64))
+			require.NoError(t, err)
+
+			// Write a header with a totalLen that exceeds the file size bounds.
+			var header [journalHeaderSize]byte
+			binary.LittleEndian.PutUint64(header[:], tc.totalLen)
+			_, err = journal.Write(header[:])
+			require.NoError(t, err)
+
+			// Pad to journalMinSize so recovery attempts to read the header.
+			_, err = journal.Write(make([]byte, journalMinSize-journalHeaderSize))
+			require.NoError(t, err)
+
+			_, err = NewWAL(journal,
+				WALFile{File: files[0], EntrySize: 32},
+				WALFile{File: files[1], EntrySize: 8},
+				WALFile{File: files[2], EntrySize: 4},
+				WALFile{File: files[3], EntrySize: 32}, // metaFile
+			)
+			require.NoError(t, err)
+
+			// Journal should be cleared.
+			_, err = journal.Seek(0, io.SeekStart)
+			require.NoError(t, err)
+			var totalLen uint64
+			err = binary.Read(journal, binary.LittleEndian, &totalLen)
+			require.NoError(t, err)
+			require.Equal(t, uint64(0), totalLen)
+
+			// Underlying files should remain unchanged.
+			var gotHash Hash
+			copy(gotHash[:], files[0].data[:32])
+			require.Equal(t, origHash, gotHash)
+			require.Equal(t, []byte{1, 2, 3, 4, 5, 6, 7, 8}, files[1].data)
+			require.Equal(t, []byte{9, 10, 11, 12}, files[2].data)
+			require.Equal(t, 64, len(files[3].data))
+		})
+	}
 }
 
 // TestWALDiscard verifies that Discard drops pending writes.

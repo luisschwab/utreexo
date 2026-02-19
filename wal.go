@@ -91,6 +91,10 @@ func NewWAL(journal io.ReadWriteSeeker, files ...WALFile) (*WAL, error) {
 		return nil, fmt.Errorf("wal recover: %w", err)
 	}
 
+	if len(files) != 4 {
+		return nil, fmt.Errorf("wal requires exactly 4 files, got %d", len(files))
+	}
+
 	for i, f := range files {
 		c, err := newCachedRWS(f.File, f.EntrySize, f.MaxCacheBytes)
 		if err != nil {
@@ -110,17 +114,8 @@ func (w *WAL) Cached(i int) *cachedRWS {
 // Flush atomically commits all cached writes through the journal.
 // The bestHash is written to metaFile (file index 3) at offset 32.
 func (w *WAL) Flush(bestHash [32]byte) error {
-	entries := w.collectEntries()
-
-	// Add consistency hash entry: file 3 (metaFile), offset 32
-	entries = append(entries, journalEntry{
-		fileIdx: 3,
-		offset:  32,
-		data:    bestHash[:],
-	})
-
-	// Serialize entries.
-	entriesBuf := serializeEntries(entries)
+	// Serialize entries directly from caches to avoid intermediate allocations.
+	entriesBuf := w.serializeEntries(bestHash)
 	totalLen := uint64(len(entriesBuf))
 
 	// Build header.
@@ -157,14 +152,8 @@ func (w *WAL) Flush(bestHash [32]byte) error {
 		return fmt.Errorf("wal journal sync: %w", err)
 	}
 
-	// Build underlying slice from cached wrappers.
-	underlying := make([]io.ReadWriteSeeker, len(w.cached))
-	for i, c := range w.cached {
-		underlying[i] = c.underlying
-	}
-
-	// Apply entries to underlying files.
-	if err := applyEntries(entries, underlying); err != nil {
+	// Apply directly from caches to underlying files.
+	if err := w.applyFromCaches(bestHash); err != nil {
 		return fmt.Errorf("wal apply: %w", err)
 	}
 
@@ -190,6 +179,76 @@ func (w *WAL) Flush(bestHash [32]byte) error {
 	return nil
 }
 
+// serializeEntries encodes journal entries directly from caches into a byte slice,
+// avoiding intermediate allocations. Includes the bestHash entry for metaFile.
+func (w *WAL) serializeEntries(bestHash [32]byte) []byte {
+	// Pre-calculate total size.
+	size := 0
+	for _, c := range w.cached {
+		size += c.cache.count() * (entryHeaderSize + c.cache.entrySize())
+	}
+	// Add bestHash entry: file 3, offset 32, 32 bytes data.
+	size += entryHeaderSize + 32
+
+	buf := make([]byte, 0, size)
+
+	// Serialize entries from each cache.
+	for i, c := range w.cached {
+		fileIdx := uint8(i)
+		c.cache.forEach(func(offset int64, data []byte) {
+			buf = append(buf, fileIdx)
+			buf = binary.LittleEndian.AppendUint64(buf, uint64(offset))
+			buf = binary.LittleEndian.AppendUint32(buf, uint32(len(data)))
+			buf = append(buf, data...)
+		})
+	}
+
+	// Add bestHash entry: file 3 (metaFile), offset 32.
+	buf = append(buf, 3)
+	buf = binary.LittleEndian.AppendUint64(buf, 32)
+	buf = binary.LittleEndian.AppendUint32(buf, 32)
+	buf = append(buf, bestHash[:]...)
+
+	return buf
+}
+
+// applyFromCaches writes cached entries directly to underlying files,
+// avoiding intermediate allocations. Includes the bestHash entry.
+func (w *WAL) applyFromCaches(bestHash [32]byte) error {
+	for i, c := range w.cached {
+		var applyErr error
+		c.cache.forEach(func(offset int64, data []byte) {
+			if applyErr != nil {
+				return
+			}
+			if _, err := c.underlying.Seek(offset, io.SeekStart); err != nil {
+				applyErr = fmt.Errorf("file %d seek to %d: %w", i, offset, err)
+				return
+			}
+			if _, err := c.underlying.Write(data); err != nil {
+				applyErr = fmt.Errorf("file %d write at %d: %w", i, offset, err)
+				return
+			}
+		})
+		if applyErr != nil {
+			return applyErr
+		}
+	}
+
+	// Write bestHash to metaFile (file 3) at offset 32.
+	if len(w.cached) > 3 {
+		metaFile := w.cached[3].underlying
+		if _, err := metaFile.Seek(32, io.SeekStart); err != nil {
+			return fmt.Errorf("metaFile seek: %w", err)
+		}
+		if _, err := metaFile.Write(bestHash[:]); err != nil {
+			return fmt.Errorf("metaFile write bestHash: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Discard drops all pending writes without committing.
 func (w *WAL) Discard() {
 	for _, c := range w.cached {
@@ -205,49 +264,6 @@ func (w *WAL) FlushNeeded() bool {
 		}
 	}
 	return false
-}
-
-// collectEntries gathers all cached writes from every cachedRWS.
-func (w *WAL) collectEntries() []journalEntry {
-	var entries []journalEntry
-	for i, c := range w.cached {
-		fileIdx := uint8(i)
-		c.cache.forEach(func(offset int64, data []byte) {
-			// Copy the data since forEach may reuse the slice.
-			dataCopy := make([]byte, len(data))
-			copy(dataCopy, data)
-			entries = append(entries, journalEntry{
-				fileIdx: fileIdx,
-				offset:  offset,
-				data:    dataCopy,
-			})
-		})
-	}
-	return entries
-}
-
-// serializeEntries encodes journal entries into a byte slice.
-func serializeEntries(entries []journalEntry) []byte {
-	size := 0
-	for _, e := range entries {
-		size += entryHeaderSize + len(e.data)
-	}
-
-	buf := make([]byte, 0, size)
-	for _, e := range entries {
-		buf = append(buf, e.fileIdx)
-
-		var offsetBuf [8]byte
-		binary.LittleEndian.PutUint64(offsetBuf[:], uint64(e.offset))
-		buf = append(buf, offsetBuf[:]...)
-
-		var lenBuf [4]byte
-		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(e.data)))
-		buf = append(buf, lenBuf[:]...)
-
-		buf = append(buf, e.data...)
-	}
-	return buf
 }
 
 // parseEntries decodes journal entries from a byte slice.
@@ -336,6 +352,14 @@ func (w *WAL) recoverFromJournal(underlying []io.ReadWriteSeeker) error {
 
 	if totalLen == 0 {
 		return nil // No pending transaction.
+	}
+
+	// Bound totalLen to the file size and int64 limits to avoid overflow/OOM.
+	if totalLen > uint64(size)-journalMinSize {
+		return w.clearJournal()
+	}
+	if totalLen > ^uint64(0)>>1 { // max int64
+		return w.clearJournal()
 	}
 
 	// Check if the full record fits in the file.
