@@ -59,6 +59,9 @@ const (
 	journalChecksumSize = 4  // uint32 CRC32
 	entryHeaderSize     = 13 // 1 (fileIdx) + 8 (offset) + 4 (dataLen)
 	journalMinSize      = journalHeaderSize + journalHashSize + journalChecksumSize
+
+	metaFileIdx    = 3  // index of the metadata file in the WAL file list
+	bestHashOffset = 32 // byte offset of the consistency hash in the metadata file
 )
 
 // WALFile represents an underlying file with its entry size and cache config.
@@ -75,6 +78,10 @@ type WALFile struct {
 // Each file's MaxCacheBytes sets its memory threshold for signaling flush needed.
 // If MaxCacheBytes is 0, a default of 64MB is used.
 func NewWAL(journal io.ReadWriteSeeker, files ...WALFile) (*WAL, error) {
+	if len(files) != 4 {
+		return nil, fmt.Errorf("wal requires exactly 4 files, got %d", len(files))
+	}
+
 	underlying := make([]io.ReadWriteSeeker, len(files))
 	for i, f := range files {
 		underlying[i] = f.File
@@ -89,10 +96,6 @@ func NewWAL(journal io.ReadWriteSeeker, files ...WALFile) (*WAL, error) {
 	// since newCachedRWS reads the underlying file size.
 	if err := w.recoverFromJournal(underlying); err != nil {
 		return nil, fmt.Errorf("wal recover: %w", err)
-	}
-
-	if len(files) != 4 {
-		return nil, fmt.Errorf("wal requires exactly 4 files, got %d", len(files))
 	}
 
 	for i, f := range files {
@@ -187,7 +190,7 @@ func (w *WAL) serializeEntries(bestHash [32]byte) []byte {
 	for _, c := range w.cached {
 		size += c.cache.count() * (entryHeaderSize + c.cache.entrySize())
 	}
-	// Add bestHash entry: file 3, offset 32, 32 bytes data.
+	// Add bestHash entry for metaFile.
 	size += entryHeaderSize + 32
 
 	buf := make([]byte, 0, size)
@@ -203,9 +206,9 @@ func (w *WAL) serializeEntries(bestHash [32]byte) []byte {
 		})
 	}
 
-	// Add bestHash entry: file 3 (metaFile), offset 32.
-	buf = append(buf, 3)
-	buf = binary.LittleEndian.AppendUint64(buf, 32)
+	// Add bestHash entry for metaFile.
+	buf = append(buf, metaFileIdx)
+	buf = binary.LittleEndian.AppendUint64(buf, bestHashOffset)
 	buf = binary.LittleEndian.AppendUint32(buf, 32)
 	buf = append(buf, bestHash[:]...)
 
@@ -235,15 +238,13 @@ func (w *WAL) applyFromCaches(bestHash [32]byte) error {
 		}
 	}
 
-	// Write bestHash to metaFile (file 3) at offset 32.
-	if len(w.cached) > 3 {
-		metaFile := w.cached[3].underlying
-		if _, err := metaFile.Seek(32, io.SeekStart); err != nil {
-			return fmt.Errorf("metaFile seek: %w", err)
-		}
-		if _, err := metaFile.Write(bestHash[:]); err != nil {
-			return fmt.Errorf("metaFile write bestHash: %w", err)
-		}
+	// Write bestHash to metaFile at bestHashOffset.
+	metaFile := w.cached[metaFileIdx].underlying
+	if _, err := metaFile.Seek(bestHashOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("metaFile seek: %w", err)
+	}
+	if _, err := metaFile.Write(bestHash[:]); err != nil {
+		return fmt.Errorf("metaFile write bestHash: %w", err)
 	}
 
 	return nil
@@ -288,6 +289,9 @@ func parseEntries(buf []byte) ([]journalEntry, error) {
 			offset:  offset,
 			data:    data,
 		})
+	}
+	if len(buf) != 0 {
+		return nil, fmt.Errorf("wal: %d trailing bytes after last entry", len(buf))
 	}
 	return entries, nil
 }
