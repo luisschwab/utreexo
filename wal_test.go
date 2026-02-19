@@ -277,7 +277,7 @@ func TestWALIncompleteJournal(t *testing.T) {
 	_, err := files[0].Write(origHash[:])
 	require.NoError(t, err)
 
-	// Write a journal with valid header + entries but NO checksum
+	// Write a journal with valid header + bestHash + entries but NO checksum
 	// (simulating crash mid-write).
 	badHash := testHashFromInt(999)
 	entries := []journalEntry{
@@ -289,7 +289,11 @@ func TestWALIncompleteJournal(t *testing.T) {
 	var header [journalHeaderSize]byte
 	binary.LittleEndian.PutUint64(header[:], totalLen)
 
+	var bestHash [journalHashSize]byte
+
 	_, err = journal.Write(header[:])
+	require.NoError(t, err)
+	_, err = journal.Write(bestHash[:])
 	require.NoError(t, err)
 	_, err = journal.Write(entriesBuf)
 	require.NoError(t, err)
@@ -331,7 +335,11 @@ func TestWALCorruptChecksum(t *testing.T) {
 	var header [journalHeaderSize]byte
 	binary.LittleEndian.PutUint64(header[:], totalLen)
 
+	var bestHash [journalHashSize]byte
+
 	_, err = journal.Write(header[:])
+	require.NoError(t, err)
+	_, err = journal.Write(bestHash[:])
 	require.NoError(t, err)
 	_, err = journal.Write(entriesBuf)
 	require.NoError(t, err)
@@ -601,13 +609,6 @@ func TestWALForestIntegration(t *testing.T) {
 			"block %d: roots differ", b)
 	}
 
-	// Snapshot underlying file contents before flush.
-	// (memFile.Read auto-extends with zeros on cache misses, so the
-	// underlying may have grown, but it should only contain zeros
-	// at positions that were never written through the WAL.)
-	preFlushMain := make([]byte, len(mainFile.data))
-	copy(preFlushMain, mainFile.data)
-
 	// Flush through WAL.
 	require.NoError(t, w.Flush([32]byte{}))
 
@@ -616,7 +617,6 @@ func TestWALForestIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, forest.GetRoots(), forest2.GetRoots(),
 		"roots should match after restart from WAL-flushed data")
-	_ = preFlushMain // silence unused variable warning
 }
 
 // TestWALForestRecovery simulates a crash after WAL journal commit but
@@ -692,4 +692,106 @@ func TestWALForestRecovery(t *testing.T) {
 	// Roots should match the expected post-block-2 state.
 	require.Equal(t, expectedRoots, forest2.GetRoots(),
 		"roots should match after WAL recovery")
+}
+
+// TestWALCrashBeforeCommit simulates a crash during journal write (before
+// the checksum is flushed). The underlying files should remain at the
+// pre-crash state after recovery.
+func TestWALCrashBeforeCommit(t *testing.T) {
+	journal := newMemFile()
+	mainFile := newMemFile()
+	delFile := newMemFile()
+	addIdxFile := newMemFile()
+	metaFile := newMemFile()
+
+	w, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	forest, err := NewForest(w.Cached(0), w.Cached(1), w.Cached(2), w.Cached(3), 10)
+	require.NoError(t, err)
+
+	pollard := NewAccumulator()
+
+	// Add 8 leaves (block 1).
+	leaves := make([]Leaf, 8)
+	for i := range leaves {
+		leaves[i] = Leaf{Hash: testHashFromInt(i + 1)}
+	}
+	err = forest.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+	err = pollard.Modify(leaves, nil, Proof{})
+	require.NoError(t, err)
+
+	// Flush block 1 — this completes normally.
+	require.NoError(t, w.Flush([32]byte{}))
+
+	// Save the expected roots from block 1.
+	block1Roots := forest.GetRoots()
+
+	// Now delete 2 leaves (block 2).
+	delHashes := []Hash{leaves[0].Hash, leaves[3].Hash}
+	forestProof, err := forest.Prove(delHashes)
+	require.NoError(t, err)
+	err = forest.Modify(nil, delHashes, forestProof)
+	require.NoError(t, err)
+
+	// Simulate crash: journal written but checksum NOT flushed.
+	require.NoError(t, w.crashBeforeCommit())
+
+	// "Restart": create a new WAL which should discard incomplete journal.
+	w2, err := NewWAL(journal,
+		WALFile{File: mainFile, EntrySize: 32},
+		WALFile{File: delFile, EntrySize: 8},
+		WALFile{File: addIdxFile, EntrySize: 4},
+		WALFile{File: metaFile, EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	// Build forest from underlying files — should be at block 1 state.
+	forest2, err := NewForest(
+		w2.Cached(0), w2.Cached(1), w2.Cached(2), w2.Cached(3), 10,
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, block1Roots, forest2.GetRoots(),
+		"roots should match block 1 state after discarding incomplete journal")
+}
+
+// TestWALFlushNeeded verifies that FlushNeeded returns true when a cache
+// exceeds its memory threshold.
+func TestWALFlushNeeded(t *testing.T) {
+	journal := newMemFile()
+	files := [4]*memFile{newMemFile(), newMemFile(), newMemFile(), newMemFile()}
+
+	// Use a tiny MaxCacheBytes for file 0 so it overflows quickly.
+	w, err := NewWAL(journal,
+		WALFile{File: files[0], EntrySize: 32, MaxCacheBytes: 100},
+		WALFile{File: files[1], EntrySize: 8},
+		WALFile{File: files[2], EntrySize: 4},
+		WALFile{File: files[3], EntrySize: 32},
+	)
+	require.NoError(t, err)
+
+	// Initially, no flush needed.
+	require.False(t, w.FlushNeeded(), "should not need flush initially")
+
+	// Write enough entries to overflow the tiny cache.
+	for i := range 100 {
+		h := testHashFromInt(i)
+		_, err = w.Cached(0).Seek(int64(i)*32, io.SeekStart)
+		require.NoError(t, err)
+		_, err = w.Cached(0).Write(h[:])
+		require.NoError(t, err)
+	}
+
+	require.True(t, w.FlushNeeded(), "should need flush after overflowing cache")
+
+	// After flush, FlushNeeded should be false again.
+	require.NoError(t, w.Flush([32]byte{}))
+	require.False(t, w.FlushNeeded(), "should not need flush after Flush")
 }
